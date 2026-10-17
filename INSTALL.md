@@ -154,9 +154,9 @@ AI keys and uploaded documents are preserved. `.env` is created only when absent
 with Ollama disabled; enter credentials in the app rather than committing them.
 
 Parakeet downloads into the profile's `whisper-models` directory (or its existing
-junction). On the original Windows machine this junction points into
-`D:\new-projects\google-meet\models\speech`. New installs use normal per-user
-application storage. Model files are fetched from a pinned Hugging Face revision
+junction). New installs use normal per-user application storage. If retiring an
+older source folder, migrate any model junction before removing its target.
+Model files are fetched from a pinned Hugging Face revision
 and checked by size and SHA-256; they are not stored in Git. Interrupted model
 downloads retry in bounded chunks and resume when setup is run again.
 

@@ -65,7 +65,6 @@ def refresh_path() -> None:
         segment for value in paths for segment in value.split(os.pathsep) if segment
     ))
     os.environ["PYTHON"] = sys.executable
-    os.environ["npm_config_python"] = sys.executable
     os.environ["NATIVELY_CORE_SMOKE"] = "1"
     os.environ.pop("ELECTRON_RUN_AS_NODE", None)
 
