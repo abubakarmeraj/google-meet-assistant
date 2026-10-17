@@ -77,6 +77,36 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaises(bootstrap.RestartRequired):
                 bootstrap.Runner(Path(tmp) / "log.txt").run(["fake-installer"], interactive=True)
 
+    def test_missing_tools_install_and_revalidate(self):
+        missing = [("C++ tools", "Microsoft.VisualStudio.2022.BuildTools", "--wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"),
+                   ("Rust", "Rustlang.Rustup", None)]
+        runner = Mock()
+        with patch.object(bootstrap, "tools_needed", side_effect=[missing, []]), \
+                patch.object(bootstrap.shutil, "which", return_value="winget.exe"), patch.object(bootstrap, "refresh_path"):
+            bootstrap.install_tools(runner, "docker", True)
+        calls = [call.args[0] for call in runner.run.call_args_list]
+        self.assertIn("--override", calls[0])
+        self.assertIn("--norestart", calls[0][-1])
+        self.assertEqual(calls[-1], ["rustup", "default", "stable-x86_64-pc-windows-msvc"])
+        self.assertFalse(any("Docker.DockerDesktop" in args for args in calls))
+
+    def test_missing_winget_stops_before_mutation(self):
+        runner = Mock()
+        with patch.object(bootstrap, "tools_needed", return_value=[("Git", "Git.Git", None)]), \
+                patch.object(bootstrap.shutil, "which", return_value=None):
+            with self.assertRaises(bootstrap.SetupError):
+                bootstrap.install_tools(runner, "none", False)
+        runner.run.assert_not_called()
+
+    def test_check_does_not_create_files_or_install(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LOCALAPPDATA": tmp}), \
+                patch.object(bootstrap.sys, "platform", "win32"), patch.object(bootstrap.platform, "machine", return_value="AMD64"), \
+                patch.object(bootstrap, "refresh_path"), patch.object(bootstrap, "tools_needed", return_value=[]), \
+                patch.object(bootstrap, "install_tools") as installer:
+            self.assertEqual(bootstrap.main(["--check", "--search", "none", "--directory", str(Path(tmp) / "new app")]), 0)
+            installer.assert_not_called()
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
     @unittest.skipUnless(os.name == "nt", "Windows process and file-lock integration")
     def test_real_process_failure_and_lock_release(self):
         with tempfile.TemporaryDirectory() as tmp:
