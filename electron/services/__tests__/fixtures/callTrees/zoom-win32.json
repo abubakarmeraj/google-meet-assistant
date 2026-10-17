@@ -1,0 +1,104 @@
+{
+ "note": "SYNTHETIC: hand-written from the apps' published accessibility labels, not recorded from a call. Replace with a tree recorded by NATIVELY_DUMP_CALL_TREE=1 from a real call on this app and OS.",
+ "app": "zoom",
+ "platform": "win32",
+ "expect": {
+  "people": [
+   [
+    "Rob Lane",
+    true
+   ],
+   [
+    "Priya Nair",
+    false
+   ]
+  ],
+  "selfNames": [
+   "Evin John"
+  ]
+ },
+ "tree": {
+  "trusted": true,
+  "truncated": false,
+  "elapsedMs": 120,
+  "windows": [
+   {
+    "title": "Zoom Meeting",
+    "nodes": [
+     {
+      "depth": 0,
+      "role": "Window",
+      "name": "Zoom Meeting",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "Pane",
+      "name": "Video",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "Text",
+      "name": "Rob Lane is speaking",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "List",
+      "name": "Participants",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "ListItem",
+      "name": "Evin John (Host, Me), Unmuted, Video on",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "ListItem",
+      "name": "Priya Nair, Muted, Video on",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "ListItem",
+      "name": "Rob Lane (Guest), Unmuted, Video off",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "Button",
+      "name": "Stop Video",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "Button",
+      "name": "Share Screen",
+      "description": "",
+      "value": "",
+      "id": ""
+     }
+    ]
+   }
+  ]
+ }
+}

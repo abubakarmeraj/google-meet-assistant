@@ -1,0 +1,679 @@
+// electron/services/screen/ScreenUnderstandingService.ts
+//
+// VISION-FIRST screen understanding pipeline for Natively.
+//
+// Flow:
+//   request
+//   → resolve image paths (or capture if missing)
+//   → validate paths (defense-in-depth — IPC handler also validates)
+//   → perceptual hash for cache/dedupe
+//   → build provider list via buildVisionProviders() — order depends on mode
+//   → runVisionFallback() — first non-empty success wins
+//   → classify result into a ScreenUnderstandingResult
+//
+// What this service NO LONGER does (legacy OCR pivot, 2026-05-17):
+//   - Tesseract OCR. Removed from the default path. The old OcrProviderManager
+//     still exists for tests but is not invoked here.
+//   - "OCR-first, vision when warranted" branching. Vision is always the path.
+//   - Modes 'auto' / 'ocr_only' / 'private' (with local OCR). Replaced by
+//     vision_first / vision_only / private_vision (see SettingsManager).
+//
+// What this service intentionally does NOT do:
+//   - Hold provider API clients. Those live in LLMHelper. We declare a thin
+//     ProviderInvoker contract so tests can inject fake providers and the
+//     production wiring uses LLMHelper-backed adapters.
+
+import { app } from 'electron';
+import { validateImagePath } from '../../utils/curlUtils';
+import { ImageHashService } from './ImageHashService';
+import {
+  runVisionFallback,
+  VisionFallbackResult,
+  VisionProviderConfig,
+  VisionMode,
+  VisionFailureReason,
+  VisionRungHealth,
+} from './VisionProviderFallbackChain';
+import { getImageOptimizer, ImageOptimizer } from './ImageOptimizer';
+import { buildVisionProviders, selectionRung, VisionProviderBuildInputs } from './VisionProviderRegistry';
+import { forgetBreakersOfOtherSelections } from '../../llm/visionOrdering';
+import { resolveOllamaRecordTarget } from '../../llm/activeCustomProvider';
+
+export type UserAction =
+  | 'manual_use_screen'
+  | 'dynamic_action'
+  | 'shortcut'
+  | 'code_hint'
+  | 'brainstorm'
+  | 'what_to_say'
+  /**
+   * Transcribe the screen for MEMORY, not to answer this turn.
+   *
+   * Every other action routes to a prompt that asks the model to "answer
+   * concisely", which is right for the turn in front of the user and useless as
+   * a record: verified live, the text stored for a build-failure screenshot was
+   * "Your build failed because you've run out of disk quota" — second person,
+   * paraphrased, with the error code and ticket reference the user later asked
+   * about nowhere in it. Before this, STRUCTURED_EXTRACTION_SYSTEM_PROMPT had NO
+   * caller at all: every call site passed `manual_use_screen` or `what_to_say`,
+   * both of which take the direct-answer branch.
+   */
+  | 'transcribe';
+
+export type QualityMode = 'fast' | 'balanced' | 'best' | 'private';
+
+export type ScreenUnderstandingMode = VisionMode;
+
+export type ScreenStatus = 'available' | 'failed' | 'permission_missing' | 'unavailable';
+
+export type ScreenSource = 'vision_direct' | 'vision_extract' | 'unavailable';
+
+export type ScreenType =
+  | 'document'
+  | 'code'
+  | 'slide'
+  | 'table'
+  | 'chart'
+  | 'ui'
+  | 'error'
+  | 'diagram'
+  | 'dashboard'
+  | 'unknown';
+
+export interface ScreenUnderstandingRequest {
+  modeId: string;
+  modeTemplateType?: string;
+  transcript?: string;
+  userAction: UserAction;
+  qualityMode: QualityMode;
+  imagePath?: string;
+  imagePaths?: string[];
+  captureIfMissing?: boolean;
+  activeApp?: string;
+  windowTitle?: string;
+  screenUnderstandingMode?: ScreenUnderstandingMode;
+  technicalInterviewVisionFirst?: boolean;
+  providerPolicy?: ProviderPolicy;
+}
+
+export interface ProviderPolicy {
+  localOnly?: boolean;
+  allowScreenshots?: boolean;
+  visionAvailable?: boolean;
+  localVisionAvailable?: boolean;
+}
+
+export interface ScreenUnderstandingResult {
+  status: ScreenStatus;
+  source: ScreenSource;
+  screenType: ScreenType;
+  providerUsed?: string;
+  modelUsed?: string;
+  attempts: VisionFallbackResult['attempts'];
+  visibleSummary?: string;
+  extractedText?: string;
+  codeBlocks?: string[];
+  tables?: Array<{ title?: string; rows: string[][]; markdown?: string }>;
+  errors?: string[];
+  taskDetected?: string;
+  confidence: number;
+  imagePaths: string[];
+  optimizedImagePath?: string;
+  imageHash?: string;
+  capturedAt: number;
+  durationMs: number;
+  warnings: string[];
+  failureReason?: VisionFailureReason;
+  unavailableReason?: string;
+  // PromptAssembler compatibility — populated so existing callers that read
+  // `ocrText` or `imagePath` keep working without a sweeping rename.
+  ocrText?: string;
+  imagePath?: string;
+  hash?: string;
+  timestamp?: number;
+  // Marker so PromptAssembler knows this came from vision, not OCR.
+  source_kind?: 'vision' | 'ocr_legacy';
+  /**
+   * Read while "Keep screenshots on this device" was on (2026-10-01). The text
+   * composed from this result is marked, and from then on is shown only to a
+   * model on this device — see on-device-screen.ts. Sticky: turning the
+   * setting off later does not release text that was read under it.
+   */
+  keptOnDevice?: boolean;
+}
+
+/**
+ * Wall-clock ceiling on the ENTIRE screen-understanding pre-pass — every rung
+ * the fallback chain walks, not one attempt. See the call site in understand()
+ * for why a best-effort enrichment step on the critical path needs a total
+ * bound rather than a per-provider one.
+ *
+ * 6000, below the chain's 12s per-provider default: the per-attempt timeout is
+ * clamped to whatever is left of this, so this is the number that decides how
+ * long a user waits before their answer starts.
+ */
+export const SCREEN_UNDERSTANDING_TOTAL_BUDGET_MS = 6000;
+
+/**
+ * The time a LOCAL model gets to write the after-the-answer screen record
+ * (2026-10-01). Far longer than the budget above: the record runs after the
+ * answer has been delivered, and a local vision model needs tens of seconds
+ * where a cloud one needs two. Not measured against a real Ollama (none on the
+ * development machine); an answer starting on the same daemon cancels the
+ * record (LLMHelper.cancelOllamaRecordFor), so this bounds only idle time.
+ */
+export const OLLAMA_RECORD_BUDGET_MS = 45_000;
+
+export class ScreenUnderstandingService {
+  private imageHashService: ImageHashService;
+  private optimizer: ImageOptimizer;
+  private lastResult: ScreenUnderstandingResult | null = null;
+  /**
+   * What was ASKED of the cached image, not just which image it was.
+   *
+   * cacheLookup keyed on the image alone, and the prompt varies by userAction:
+   * 'what_to_say' produces a concise ANSWER, 'transcribe' produces a full
+   * transcription. Same screen, deliberately different results. Verified live:
+   * the transcription request that follows an answer on the same screenshot got
+   * handed the ANSWER back, so the conversation record stored "Your build failed
+   * because you've run out of disk quota" instead of the screen's text, and a
+   * follow-up asking for the error code could never be answered.
+   */
+  private lastResultKind: string | null = null;
+  private readonly STALE_THRESHOLD_MS = 5 * 60 * 1000;
+  /**
+   * Per-rung failure memory, held on the singleton so it survives across turns
+   * (the chain itself is a pure function called once per screenshot).
+   *
+   * This is what stops a dead rung from charging the user its share of the
+   * pre-pass budget on every single press. Note the boundary: it helps from the
+   * SECOND failing turn onward — the first turn after an app start, or after a
+   * cooldown lapses, still pays. That is deliberate; a provider that recovers
+   * has to be allowed to prove it.
+   */
+  private readonly rungHealth = new Map<string, VisionRungHealth>();
+  /** Which selection each selection-carrying rung last ran for (see understand()). */
+  private readonly rungLedFor = new Map<string, string>();
+
+  constructor(optimizer?: ImageOptimizer) {
+    this.imageHashService = new ImageHashService();
+    this.optimizer = optimizer || getImageOptimizer();
+  }
+
+  async understand(request: ScreenUnderstandingRequest): Promise<ScreenUnderstandingResult> {
+    const started = Date.now();
+    const warnings: string[] = [];
+    const mode: ScreenUnderstandingMode = (request.screenUnderstandingMode || 'vision_first') as ScreenUnderstandingMode;
+    const policy: ProviderPolicy = request.providerPolicy || {};
+
+    // Honor screenshots-scope gate up front — never even resolve paths if the user
+    // disabled screenshots for the active provider.
+    if (policy.allowScreenshots === false) {
+      warnings.push('Screenshots disabled by provider data scope');
+      return this.buildUnavailable({
+        request,
+        warnings,
+        started,
+        failureReason: 'scope_blocked',
+        unavailableReason: 'Screenshots are disabled for the current provider. Enable the screenshots scope to attach screen context.',
+      });
+    }
+
+    // Resolve image paths (capture if requested + missing).
+    let imagePaths = request.imagePaths || (request.imagePath ? [request.imagePath] : []);
+    if (request.captureIfMissing && imagePaths.length === 0) {
+      try {
+        imagePaths = [await this.captureScreenshot()];
+      } catch (err: any) {
+        warnings.push(`Screenshot capture failed: ${err?.message || 'unknown error'}`);
+        return this.buildUnavailable({
+          request,
+          warnings,
+          started,
+          status: 'permission_missing',
+          unavailableReason:
+            process.platform === 'darwin'
+              ? 'Could not capture the screen. Check Screen Recording permission in System Settings → Privacy & Security → Screen Recording.'
+              : 'Could not capture the screen. Check your display configuration and try again.',
+        });
+      }
+    }
+
+    // Validate paths.
+    const userDataDir =
+      (app?.getPath ? app.getPath('userData') : undefined) ||
+      process.env.NATIVELY_TEST_USER_DATA ||
+      '';
+    const validPaths: string[] = [];
+    for (const p of imagePaths) {
+      const v = validateImagePath(p, userDataDir);
+      if (!v.isValid) {
+        warnings.push(`Invalid image path rejected: ${v.reason}`);
+        continue;
+      }
+      validPaths.push(p);
+    }
+    if (validPaths.length === 0) {
+      warnings.push('No valid image paths available');
+      return this.buildUnavailable({ request, warnings, started });
+    }
+
+    // Hash for cache.
+    let imageHash: string | undefined;
+    try {
+      imageHash = await this.imageHashService.computeHash(validPaths[validPaths.length - 1]);
+    } catch {
+      try {
+        imageHash = await this.imageHashService.quickHash(validPaths[validPaths.length - 1]);
+      } catch {
+        imageHash = undefined;
+      }
+    }
+
+    // Cache lookup — same image AND same question-kind within 5 min → reuse.
+    const resultKind = request.userAction === 'transcribe' ? 'transcribe' : 'answer';
+    if (imageHash) {
+      const cached = this.cacheLookup(imageHash, resultKind);
+      if (cached) return cached;
+    }
+
+    // Build the provider list per mode. Production callers inject this via
+    // buildVisionProviders(); tests can substitute their own list via the
+    // optional `request.providerPolicy.__providersOverride` hook (untyped to
+    // keep the public contract clean).
+    // The record may be written by the selected Ollama's vision model. Finding
+    // that model is asynchronous (/api/tags + /api/show, bounded and cached in
+    // the helper) and the registry is not, so it is resolved here first. Record
+    // calls only: the pre-pass never uses Ollama and must not wait for this.
+    const isRecord = request.userAction === 'transcribe';
+    if (isRecord) await resolveOllamaRecordTarget();
+
+    const providers: VisionProviderConfig[] = (request.providerPolicy as any)?.__providersOverride
+      || buildVisionProviders(this.collectBuildInputs(request, mode, policy));
+
+    if (providers.length === 0) {
+      warnings.push('No vision provider configured');
+      return this.buildUnavailable({
+        request,
+        warnings,
+        started,
+        failureReason: 'no_vision_provider',
+        imagePaths: validPaths,
+        imageHash,
+        unavailableReason: mode === 'private_vision'
+          ? 'No local vision provider is available for the screen pre-pass. A local custom endpoint that reads images can run it; with Ollama, the screenshot is read in the answer itself.'
+          : 'No vision-capable provider is configured. Add an API key for OpenAI, Claude, Gemini, Groq, or Natively, or configure a local Ollama vision model.',
+      });
+    }
+
+    // Pick optimization profile.
+    const profile = this.pickOptimizationProfile(request);
+
+    // System & user prompts come from the prompts module (Phase 6).
+    const { systemPrompt, userPrompt, isTechnical } = await this.buildPrompts(request);
+
+    // A breaker opened for a DIFFERENT selection says nothing about this one:
+    // the `openrouter` rung is `openrouter` for every model, so a model whose
+    // upstream was failing kept the rung skipped after the user picked another.
+    const carrying = selectionRung();
+    if (carrying) forgetBreakersOfOtherSelections(this.rungLedFor, this.rungHealth, [carrying.id], carrying.key);
+
+    // Run the chain.
+    const latestPath = validPaths[validPaths.length - 1];
+    // The Ollama record rung runs as a SECOND stage with its own time limit
+    // (below), so everything else — the pre-pass, and the cloud record — keeps
+    // the 6 s envelope it always had.
+    const ollamaRecordRung = isRecord ? providers.find(p => p.id === 'ollama') : undefined;
+    const firstStage = ollamaRecordRung ? providers.filter(p => p !== ollamaRecordRung) : providers;
+    let result = await runVisionFallback({
+      imagePath: latestPath,
+      cacheKey: imageHash,
+      mode,
+      providers: firstStage,
+      systemPrompt,
+      userPrompt,
+      optimizer: this.optimizer,
+      optimizationProfile: profile,
+      // Screen understanding is BEST-EFFORT ENRICHMENT sitting on the critical
+      // path: `generate-what-to-say` awaits it before the answer stream opens,
+      // and the answer itself already receives the screenshot through
+      // streamVisionWithFallback. Every millisecond spent here is added to
+      // time-to-first-token for a structured extraction the turn can do without.
+      //
+      // It had no total bound at all. In natively_debug (3).log that cost the
+      // user 8.0s on 31 of 33 turns — the Natively rung's inner timeout, which
+      // happened to be the only thing stopping the chain because their build
+      // then skipped every remaining rung. On a build that walks the whole chain
+      // (post-3e29a67f) the same failure would have cost 8s PLUS a real call to
+      // their own provider, so fixing the skip makes the latency worse unless
+      // this bound exists. A provider that cannot describe a screenshot inside
+      // the budget is not worth delaying the answer for; failing fast to "no
+      // screen context" is the cheaper outcome, and the healthy case (a cloud
+      // vision rung returning in 2-4s) never reaches this ceiling.
+      totalDeadlineMs: SCREEN_UNDERSTANDING_TOTAL_BUDGET_MS,
+      health: this.rungHealth,
+    });
+
+    // "Send it to cloud if available, else send it to the Ollama model" (Evin,
+    // 2026-10-01): nothing above produced a record — no cloud provider, every
+    // one failed, or "Keep screenshots on this device" allows none — so the
+    // selected Ollama's vision model writes it. The chain applies the same
+    // eligibility rules (a remote Ollama is skipped in that mode).
+    if (!result.ok && ollamaRecordRung) {
+      const local = await runVisionFallback({
+        imagePath: latestPath,
+        cacheKey: imageHash,
+        mode,
+        providers: [ollamaRecordRung],
+        systemPrompt,
+        userPrompt,
+        optimizer: this.optimizer,
+        optimizationProfile: profile,
+        perProviderTimeoutMs: OLLAMA_RECORD_BUDGET_MS,
+        totalDeadlineMs: OLLAMA_RECORD_BUDGET_MS,
+        health: this.rungHealth,
+      });
+      result = { ...local, attempts: [...result.attempts, ...local.attempts], durationMs: result.durationMs + local.durationMs };
+    }
+
+    // The chain's attempt ledger is otherwise WRITE-ONLY: runVisionFallback
+    // reports through `params.telemetry?.()`, this call site passed no callback,
+    // and `result.attempts` only ever reached the IPC response — never a log.
+    // A user debug log therefore showed a bare "[NativelyAPI] JSON pre-response
+    // failure" and then nothing, with no way to tell a rung that was SKIPPED
+    // (not configured / not vision-capable) from one that was tried and failed.
+    // Diagnosing natively_debug (3).log needed source archaeology and a build-
+    // dating exercise to answer "did it even try the user's own provider?".
+    // One line, every turn, answers it.
+    console.log('[ScreenUnderstanding] vision chain', {
+      ok: result.ok,
+      providerUsed: result.providerUsed,
+      failureReason: result.failureReason,
+      durationMs: result.durationMs,
+      attempts: result.attempts.map(a =>
+        a.skipped
+          ? `${a.provider}:skipped(${a.skipReason})`
+          : `${a.provider}:${a.ok ? 'ok' : (a.errorClass || 'error')}(${a.durationMs}ms)`),
+    });
+
+    const out = this.assembleResult(result, {
+      request,
+      warnings,
+      started,
+      imagePaths: validPaths,
+      imageHash,
+      isTechnical,
+    });
+    if (mode === 'private_vision' && out.status === 'available') out.keptOnDevice = true;
+    this.lastResult = out;
+    this.lastResultKind = resultKind;
+    return out;
+  }
+
+  // ── helpers ────────────────────────────────────────────────────────────
+
+  private collectBuildInputs(
+    request: ScreenUnderstandingRequest,
+    mode: ScreenUnderstandingMode,
+    policy: ProviderPolicy,
+  ): VisionProviderBuildInputs {
+    return {
+      mode,
+      localOnly: policy.localOnly === true || mode === 'private_vision',
+      scopeAllowsScreenshots: policy.allowScreenshots !== false,
+      // `transcribe` is the after-the-answer record (screenTranscription.ts);
+      // every other action describes the screen for the answer being built.
+      purpose: request.userAction === 'transcribe' ? 'record' : 'prepass',
+    };
+  }
+
+  private pickOptimizationProfile(request: ScreenUnderstandingRequest): 'fast' | 'balanced' | 'technical' | 'best' {
+    if (request.qualityMode === 'fast') return 'fast';
+    if (request.qualityMode === 'best') return 'best';
+    if (this.isTechnicalMode(request.modeTemplateType) && request.technicalInterviewVisionFirst !== false) {
+      return 'technical';
+    }
+    return 'balanced';
+  }
+
+  private async buildPrompts(request: ScreenUnderstandingRequest): Promise<{
+    systemPrompt: string;
+    userPrompt: string;
+    isTechnical: boolean;
+  }> {
+    const { buildVisionPrompts } = await import('./visionPrompts');
+    return buildVisionPrompts(request);
+  }
+
+  private async captureScreenshot(): Promise<string> {
+    const { ScreenshotHelper } = await import('../../ScreenshotHelper');
+    const helper = new ScreenshotHelper();
+    return helper.takeScreenshot();
+  }
+
+  private cacheLookup(imageHash: string, resultKind: string): ScreenUnderstandingResult | null {
+    if (!this.lastResult || this.lastResult.imageHash !== imageHash) return null;
+    // An answer is not a transcription. Serving one for the other is what made
+    // the conversation record a paraphrase of the screen instead of its text.
+    if (this.lastResultKind !== resultKind) return null;
+    // A record that FAILED is not an answer to remember (2026-10-01). Remembering
+    // it meant a screen whose record was cancelled — which any Ollama answer
+    // does to a record in flight — was never recorded, however often the same
+    // screen was captured again. The pre-pass still remembers a failure:
+    // retrying it would add its wait to every answer about that screen.
+    if (resultKind === 'transcribe' && this.lastResult.status !== 'available') return null;
+    const age = Date.now() - this.lastResult.capturedAt;
+    if (age < this.STALE_THRESHOLD_MS) return { ...this.lastResult };
+    return null;
+  }
+
+  private isTechnicalMode(modeTemplateType?: string): boolean {
+    // Shared with the adaptive image-quality exemption (technicalMode.ts).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { isTechnicalModeTemplate } = require('./technicalMode') as typeof import('./technicalMode');
+    return isTechnicalModeTemplate(modeTemplateType);
+  }
+
+  private classifyScreenType(text: string, transcript?: string): ScreenType {
+    const combined = `${text} ${transcript || ''}`.toLowerCase();
+    if (/\b(function|const|let|var|import|return|class|def|public|private|void)\b/.test(combined) && /[{}\[\];]/.test(combined)) return 'code';
+    if (/\b(error|exception|failed|cannot|undefined|null pointer|stack trace)\b/i.test(combined)) return 'error';
+    if (/\|.*\|.*\|/.test(text) || /\btable\b.*\brow\b/i.test(combined)) return 'table';
+    if (/\b(chart|graph|dashboard|metrics|percent|increase|decrease)\b/i.test(combined)) return 'chart';
+    if (/\b(slide|presentation|powerpoint|keynote)\b/i.test(combined)) return 'slide';
+    if (/\b(document|article|paper|paragraph|section)\b/i.test(combined)) return 'document';
+    if (/\b(button|menu|dialog|window|checkbox|radio|dropdown)\b/i.test(combined)) return 'ui';
+    return 'unknown';
+  }
+
+  private detectTask(text: string, transcript?: string): string | undefined {
+    const combined = `${text} ${transcript || ''}`;
+    if (/\b(two sum|leetcode|algorithm|coding problem)\b/i.test(combined)) return 'coding_interview';
+    if (/\b(sales|pricing|quote|discount)\b/i.test(combined)) return 'sales_interaction';
+    if (/\b(lecture|teaching|course|lesson)\b/i.test(combined)) return 'lecture_note';
+    return undefined;
+  }
+
+  // Lightweight structured extraction from the model's text output.
+  // If the model returned JSON (structured-extract path), parse it.
+  // Otherwise treat the output as `visibleSummary` and run regex extractors.
+  private extractStructured(rawOutput: string): {
+    visibleSummary: string;
+    extractedText: string;
+    codeBlocks: string[];
+    tables: Array<{ rows: string[][]; markdown?: string }>;
+    errors: string[];
+    screenType?: ScreenType;
+    taskDetected?: string;
+    confidence?: number;
+  } {
+    // A reply that is ONE fenced block holding JSON is that JSON (2026-10-01):
+    // small local vision models often wrap the structured answer in ```json,
+    // and the raw markup would otherwise be stored as the screen's text.
+    const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/i.exec(rawOutput.trim());
+    const trimmed = (fenced && fenced[1].trim().startsWith('{') ? fenced[1] : rawOutput).trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return {
+          visibleSummary: typeof parsed.visibleSummary === 'string' ? parsed.visibleSummary : '',
+          extractedText: typeof parsed.extractedText === 'string' ? parsed.extractedText : (typeof parsed.visibleSummary === 'string' ? parsed.visibleSummary : ''),
+          codeBlocks: Array.isArray(parsed.codeBlocks) ? parsed.codeBlocks.filter((c: any) => typeof c === 'string') : this.extractCodeBlocks(trimmed),
+          tables: Array.isArray(parsed.tables) ? parsed.tables : [],
+          errors: Array.isArray(parsed.errors) ? parsed.errors.filter((e: any) => typeof e === 'string') : [],
+          screenType: typeof parsed.screenType === 'string' ? parsed.screenType : undefined,
+          taskDetected: typeof parsed.taskDetected === 'string' ? parsed.taskDetected : undefined,
+          confidence: typeof parsed.confidence === 'number' ? parsed.confidence : undefined,
+        };
+      } catch {
+        // fall through to plain-text path
+      }
+    }
+    return {
+      visibleSummary: trimmed.length > 600 ? trimmed.substring(0, 600) + '...' : trimmed,
+      extractedText: trimmed,
+      codeBlocks: this.extractCodeBlocks(trimmed),
+      tables: [],
+      errors: this.extractErrors(trimmed),
+    };
+  }
+
+  private extractCodeBlocks(text: string): string[] {
+    const blocks: string[] = [];
+    const fence = /```[\w]*\n([\s\S]*?)\n```/g;
+    let m: RegExpExecArray | null;
+    while ((m = fence.exec(text))) {
+      if (m[1] && m[1].trim()) blocks.push(m[1].trim());
+    }
+    return blocks;
+  }
+
+  private extractErrors(text: string): string[] {
+    const errors: string[] = [];
+    for (const line of text.split('\n')) {
+      if (/\b(error|exception|failed|cannot|undefined|null pointer|stack trace|at\s+\w+\.\w+)\b/i.test(line)) {
+        errors.push(line.trim());
+      }
+    }
+    return errors.slice(0, 10);
+  }
+
+  private assembleResult(
+    fallback: VisionFallbackResult,
+    ctx: {
+      request: ScreenUnderstandingRequest;
+      warnings: string[];
+      started: number;
+      imagePaths: string[];
+      imageHash?: string;
+      isTechnical: boolean;
+    },
+  ): ScreenUnderstandingResult {
+    const now = Date.now();
+    if (!fallback.ok) {
+      const unavailableReason =
+        fallback.failureReason === 'privacy_blocked'
+          ? 'Private mode blocked all cloud vision providers and no local vision provider is configured.'
+          : fallback.failureReason === 'scope_blocked'
+            ? 'Screenshots are disabled for the active provider.'
+            : fallback.failureReason === 'no_vision_provider'
+              ? 'No vision-capable provider is configured.'
+              : 'All configured vision providers failed.';
+      return {
+        status: 'failed',
+        source: 'unavailable',
+        screenType: 'unknown',
+        attempts: fallback.attempts,
+        confidence: 0,
+        imagePaths: ctx.imagePaths,
+        imageHash: ctx.imageHash,
+        capturedAt: now,
+        durationMs: now - ctx.started,
+        warnings: ctx.warnings,
+        failureReason: fallback.failureReason,
+        unavailableReason,
+        source_kind: 'vision',
+      };
+    }
+
+    const structured = this.extractStructured(fallback.outputText || '');
+    const screenType = structured.screenType
+      || this.classifyScreenType(structured.extractedText || structured.visibleSummary, ctx.request.transcript);
+    const taskDetected = structured.taskDetected || this.detectTask(structured.extractedText || structured.visibleSummary, ctx.request.transcript);
+
+    // Technical interview / code hint / debug → mark as vision_direct (final answer).
+    // Otherwise extraction path → vision_extract.
+    const source: ScreenSource =
+      ctx.isTechnical || ctx.request.userAction === 'code_hint' || ctx.request.userAction === 'brainstorm'
+        ? 'vision_direct'
+        : 'vision_extract';
+
+    const visibleSummary = structured.visibleSummary || structured.extractedText;
+    const extractedText = structured.extractedText || visibleSummary;
+
+    return {
+      status: 'available',
+      source,
+      screenType,
+      providerUsed: fallback.providerUsed,
+      modelUsed: fallback.modelUsed,
+      attempts: fallback.attempts,
+      visibleSummary,
+      extractedText,
+      codeBlocks: structured.codeBlocks,
+      tables: structured.tables,
+      errors: structured.errors,
+      taskDetected,
+      confidence: structured.confidence ?? 0.85,
+      imagePaths: ctx.imagePaths,
+      imageHash: ctx.imageHash,
+      capturedAt: now,
+      durationMs: now - ctx.started,
+      warnings: ctx.warnings,
+      // PromptAssembler-compat fields:
+      ocrText: extractedText,                              // legacy key, populated by vision
+      imagePath: ctx.imagePaths[ctx.imagePaths.length - 1],
+      hash: ctx.imageHash,
+      timestamp: now,
+      source_kind: 'vision',
+    };
+  }
+
+  private buildUnavailable(opts: {
+    request: ScreenUnderstandingRequest;
+    warnings: string[];
+    started: number;
+    status?: ScreenStatus;
+    failureReason?: VisionFailureReason;
+    unavailableReason?: string;
+    imagePaths?: string[];
+    imageHash?: string;
+  }): ScreenUnderstandingResult {
+    const now = Date.now();
+    return {
+      status: opts.status || 'unavailable',
+      source: 'unavailable',
+      screenType: 'unknown',
+      attempts: [],
+      confidence: 0,
+      imagePaths: opts.imagePaths || [],
+      imageHash: opts.imageHash,
+      capturedAt: now,
+      durationMs: now - opts.started,
+      warnings: opts.warnings,
+      failureReason: opts.failureReason,
+      unavailableReason: opts.unavailableReason,
+      source_kind: 'vision',
+    };
+  }
+
+  getLastResult(): ScreenUnderstandingResult | null {
+    return this.lastResult;
+  }
+}
+
+let singleton: ScreenUnderstandingService | null = null;
+export function getScreenUnderstandingService(): ScreenUnderstandingService {
+  if (!singleton) singleton = new ScreenUnderstandingService();
+  return singleton;
+}

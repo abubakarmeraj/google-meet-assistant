@@ -1,0 +1,481 @@
+// electron/llm/modelCapabilities.ts
+// Routes prompt tier (full vs tiny) and context budgets based on the active model.
+// Cloud + large local models -> 'full' prompts. Small local models -> 'tiny' prompts.
+
+import type { TranscriptTurn } from './transcriptCleaner';
+
+export type ModelTier = 'cloud' | 'local-large' | 'local-small';
+export type PromptTier = 'full' | 'tiny';
+
+export interface ModelCapabilities {
+  tier: ModelTier;
+  maxContextTokens: number;
+  promptBudgetTokens: number;
+  outputBudgetTokens: number;
+  supportsXmlTags: boolean;
+  supportsImages: boolean;
+  name: string;
+}
+
+const TIER_BUDGETS: Record<ModelTier, { max: number; system: number; output: number }> = {
+  'cloud':       { max: 128_000, system: 4000, output: 4000 },
+  'local-large': { max: 32_000,  system: 1500, output: 4000 },
+  'local-small': { max: 8_000,   system: 800,  output: 2000 },
+};
+
+// Native (model-card) context windows for known Ollama families.
+// Order matters — first match wins. Longer-version patterns precede generic ones.
+const KNOWN_OLLAMA_NATIVE_CTX: Array<[RegExp, number]> = [
+  [/^qwen3/i, 32_000],
+  [/^qwen2\.5/i, 32_000],
+  [/^llama3\.1/i, 128_000],
+  [/^llama3\.2/i, 128_000],
+  [/^llama3(?![.\d])/i, 8_000],
+  [/^phi3/i, 128_000],
+  [/^gemma2/i, 8_000],
+  [/^mistral/i, 32_000],
+  [/^codellama/i, 16_000],
+  [/^deepseek-coder/i, 16_000],
+];
+
+/**
+ * Strip Natively's own routing prefix, and then the upstream segment a gateway
+ * puts in front of the real model name.
+ *
+ * WHY (2026-09-03): every predicate below matches a BARE id with `startsWith`,
+ * but `getCurrentModel()` hands them the routed id. `litellm/gpt-4o` therefore
+ * failed isCloudIdentifier, fell through to the "unknown" branch, and came back
+ * `supportsImages: false` — so Code Hint refused every LiteLLM model with
+ * "The current local model (litellm/anthropic/claude-sonnet-5) doesn't support
+ * image input… e.g. llava", reproduced in a live session. `nvidia_nim/*` was
+ * identical.
+ *
+ * Two segments come off because a real LiteLLM config names models
+ * `<upstream>/<model>` (`litellm/openai/gpt-4o`, `litellm/vertex_ai/gemini-2.5-pro`),
+ * which is exactly the shape litellmModelLabel() documents. OpenRouter is the
+ * same shape and is here for the same reason — `openrouter/anthropic/claude-sonnet-5`
+ * has to reach the predicates below as `claude-sonnet-5` or every OpenRouter
+ * model would be classified as an unknown text-only route. Only the known
+ * routing prefixes are stripped — an arbitrary id keeps its slashes, so an
+ * Ollama name like `qwen2.5-vl:7b` and a Groq id like `openai/gpt-oss-20b` are
+ * untouched.
+ */
+// Fluxion is the opposite shape to OpenRouter and the strip is load-bearing for
+// the opposite reason. Its ids are BARE vendor ids (`fluxion/claude-opus-5`),
+// so after the prefix comes off there is no vendor segment left to lose and the
+// result — `claude-opus-5` — is already exactly the id the predicates below
+// know. Do NOT "fix" this to match openrouter's two-segment handling: that
+// would eat the model name itself.
+// 9Router is OpenRouter's shape, not Fluxion's: its catalogue is namespaced by
+// upstream (`ninerouter/openai/gpt-5`, `ninerouter/gemini/gemini-3.6-flash`),
+// so both segments come off and the predicates below see `gpt-5`. Leaving it
+// out of this list is silent: every lookup misses, the id falls to the unknown
+// branch, and 30 of the 47 models a stock instance serves — all vision-capable
+// by their own catalogue — come back supportsImages:false.
+// AgentRouter is Fluxion's shape (bare vendor ids behind the prefix), so the
+// same single strip leaves `claude-opus-5` — the id the predicates know.
+const ROUTING_PREFIX_RE = /^(?:litellm|nvidia_nim|openrouter|fluxion|ninerouter|agentrouter)\//i;
+export function stripProviderRoutingPrefix(id: string): string {
+  if (!ROUTING_PREFIX_RE.test(id)) return id;
+  const withoutProvider = id.replace(ROUTING_PREFIX_RE, '');
+  // `openai/gpt-4o` → `gpt-4o`. A model name that legitimately contains a slash
+  // (`meta/llama-3.2-90b-vision-instruct`) loses only the vendor segment, which
+  // is what every predicate below wants to see.
+  const slash = withoutProvider.indexOf('/');
+  return slash === -1 ? withoutProvider : withoutProvider.slice(slash + 1);
+}
+
+// Models ids we treat as cloud regardless of provider hint.
+function isCloudIdentifier(id: string): boolean {
+  const s = id.toLowerCase();
+  if (s === 'natively' || s.startsWith('natively-')) return true;
+  if (s.startsWith('gemini-') || s.startsWith('models/gemini')) return true;
+  if (isOpenAiModelId(s)) return true;
+  if (s.startsWith('claude-')) return true;
+  // DeepSeek cloud API (OpenAI-compatible). The local Ollama "deepseek-coder"
+  // family is handled by the isOllama branch above.
+  if (isDeepseekModelId(s)) return true;
+  return false;
+}
+
+// Large Groq-hosted models we trust like cloud.
+//
+// The llama/mixtral entries are ids Groq has since retired; they stay because a
+// LiteLLM gateway or self-host can still serve them. The qwen size list did NOT
+// cover qwen3.6-27b (Groq's current flagship, and the default since the Llama
+// retirements) — a 27b model is not in {32b,72b,110b}, so it fell through to the
+// "unknown" branch below. Match Groq's current ids by name rather than by
+// guessing a parameter count out of the string.
+function isLargeGroqModel(id: string): boolean {
+  const s = id.toLowerCase();
+  if (s.includes('llama-3.3-70b') || s.includes('llama-3.1-70b') || s.includes('llama3-70b')) return true;
+  if (s.includes('mixtral-8x7b') || s.includes('mixtral-8x22b')) return true;
+  if (s.includes('qwen') && /\b(27b|32b|72b|110b)\b/.test(s)) return true;
+  if (s.startsWith('openai/gpt-oss-') || s.startsWith('groq/compound')) return true;
+  return false;
+}
+
+/**
+ * Groq-hosted models that accept image input.
+ *
+ * Exactly one: qwen3.8-27b since 2026-09-14 (qwen3.6-27b before it, from
+ * 2026-08-23). Groq retired llama-4-scout (its
+ * previous vision model) on 2026-07-17 and shipped no like-for-like successor.
+ *
+ * This must be checked explicitly. The Groq branch of getModelCapabilities()
+ * hardcoded `supportsImages: false`, and LLMHelper gates the vision path on that
+ * flag — so a Groq id that genuinely takes images was refused before the request
+ * was ever built.
+ */
+// Single source: groqModels.ts (code-review 2026-08-23 — this fact was
+// encoded in four uncoordinated places; a vision-model swap that missed one
+// silently re-armed the "Groq vision refused" bug).
+import { groqSupportsImages } from './groqModels';
+import { isDeepseekModelId } from './deepseekModels';
+import { isOpenAiModelId } from './openaiModels';
+import { isOllamaVisionModelByName, modelNameSuggestsVision } from './visionCapability';
+
+// Parse parameter size from an Ollama model id like "llama3.1:8b" or "qwen2.5-coder:14b".
+// Returns the size in billions of parameters, or null if not detected.
+export function parseOllamaSize(id: string): number | null {
+  const s = id.toLowerCase();
+  const m = s.match(/[:\-]([0-9]+(?:\.[0-9]+)?)\s*b\b/);
+  if (m) {
+    const n = parseFloat(m[1]);
+    if (!isNaN(n)) return n;
+  }
+  // Bare size hints (mini/nano/tiny) are unreliable signals — return null and let
+  // family table + tier defaults decide. Caller treats null as "unknown -> small".
+  return null;
+}
+
+/**
+ * OpenAI models outside the gpt-4o / 4.1 / 5 / 6 families that read images.
+ * Verified 2026-10-01: OpenAI's model pages ("text and image inputs") for o1,
+ * o1-pro, o3 and o4-mini; OpenRouter's input_modalities for o3-pro,
+ * o4-mini-high and gpt-4-turbo. Left out on purpose: o1-mini, o1-preview and
+ * o3-mini (text-only); gpt-4 and gpt-4-turbo-preview (the preview alias
+ * predates vision); chatgpt-4o-latest and gpt-4.5 (not verified).
+ */
+const OPENAI_VISION_EXTRA_RE = /^(?:o[13](?:-pro)?|o4-mini(?:-high)?|gpt-4-turbo)(?:-\d{4}-\d{2}-\d{2})?$/;
+
+/**
+ * DeepSeek Flash reads images. Measured twice: through AgentRouter
+ * (2026-09-30, both routes) and directly (2026-10-01, `deepseek-flash` and
+ * `deepseek-v4-flash` read the test image; DeepSeek's pricing page lists Vision
+ * for Flash). V4 Pro does NOT: sent an image directly it answers HTTP 200 with
+ * a made-up reply, so it must never be assumed.
+ *
+ * Covers the DIRECT id and AgentRouter's. Other gateways are left to their own
+ * data: OpenRouter's catalogue lists its DeepSeek Flash as text-only, and it
+ * refuses the image. Direct became true on 2026-10-01, when streamWithDeepseek
+ * learned to attach images; before that the direct adapter dropped them, and
+ * saying yes here would have promised a read that never happened.
+ */
+function deepseekFlashReadsImages(routedId: string, strippedLower: string): boolean {
+  const direct = (routedId || '').toLowerCase() === strippedLower;
+  return (direct || /^agentrouter\//i.test(routedId || '')) && /^deepseek-(?:v\d+-)?flash(?:$|-)/.test(strippedLower);
+}
+
+export function getModelCapabilities(modelId: string, isOllama: boolean): ModelCapabilities {
+  // The routed id (`litellm/openai/gpt-4o`) is what the caller has; every
+  // predicate below is written against the bare one. Resolve once, here, so a
+  // gateway-proxied model is classified as the model it actually is.
+  // `name` keeps the original so UI and log lines still say which route it came
+  // from. Ollama ids are never prefixed, so this is a no-op on that branch.
+  const id = stripProviderRoutingPrefix(modelId || '');
+  // `models/gemini-2.5-flash` is Gemini's own listing form of `gemini-2.5-flash`
+  // (isCloudIdentifier already accepts it), so every rule below sees it bare.
+  const lower = id.toLowerCase().replace(/^models\//, '');
+  const displayId = modelId || '';
+  // A gateway fronts an arbitrary upstream, so the family lists below can only
+  // recognise the subset whose bare name happens to be a known cloud model. For
+  // everything else the model NAME is the only signal available, and refusing on
+  // no signal is what made Code Hint reject `litellm/mistral/pixtral-12b` and
+  // `nvidia_nim/meta/llama-3.2-90b-vision-instruct` while the vision chain and
+  // the provider registry were both willing to call them.
+  //
+  // Only ever widens: a name with no vision marker still resolves to false. (That
+  // false no longer buys a gateway an early refusal: Code Hint's gate is gone
+  // since 2026-10-01, and the vision chain seats a SELECTED LiteLLM/NIM model
+  // whatever this says — see the known gap noted in CodeHintLLM.ts.)
+  const isGatewayRouted = id !== (modelId || '');
+  const gatewayVisionHint = isGatewayRouted && modelNameSuggestsVision(id);
+
+  if (isOllama) {
+    const size = parseOllamaSize(id);
+    // Default to small when size is unknown (safer for memory/context).
+    // Threshold lowered from 13B → 7B: modern 7-9B code models (qwen2.5-coder:7b,
+    // qwen3:8b, llama3.1:8b, deepseek-coder-v2:16b-lite) handle the full system
+    // prompt and produce multi-section coding answers comfortably. The old 13B
+    // threshold silently capped them at 180 output tokens (num_predict in
+    // streamWithOllama), truncating answers mid-function and producing the canned
+    // "Let me come back to that" fallback on follow-up turns.
+    const tier: ModelTier = (size != null && size >= 7) ? 'local-large' : 'local-small';
+    const b = TIER_BUDGETS[tier];
+    // Family-specific native context window override.
+    let maxCtx = b.max;
+    for (const [pat, ctx] of KNOWN_OLLAMA_NATIVE_CTX) {
+      if (pat.test(id)) { maxCtx = ctx; break; }
+    }
+    return {
+      tier,
+      maxContextTokens: maxCtx,
+      promptBudgetTokens: b.system,
+      outputBudgetTokens: b.output,
+      supportsXmlTags: tier === 'local-large',
+      supportsImages: isOllamaVisionModelByName(id),
+      name: displayId || 'ollama',
+    };
+  }
+
+  if (isCloudIdentifier(id)) {
+    const b = TIER_BUDGETS['cloud'];
+    const supportsImages = lower.startsWith('gemini-') || lower.startsWith('claude-')
+      || lower.startsWith('gpt-4o') || lower.startsWith('gpt-4.1') || lower.startsWith('gpt-5')
+      // gpt-6 (2026-09-30): read a test screenshot correctly through AgentRouter
+      // (gpt-6-astra, "Order #7392 — Total $148.60"). Without this every gpt-6
+      // model resolved text-only, so a screenshot was never sent to it.
+      || lower.startsWith('gpt-6')
+      || OPENAI_VISION_EXTRA_RE.test(lower)
+      || lower === 'natively' || lower.startsWith('natively-')
+      || deepseekFlashReadsImages(modelId, lower)
+      || gatewayVisionHint;
+    return {
+      tier: 'cloud',
+      maxContextTokens: b.max,
+      promptBudgetTokens: b.system,
+      outputBudgetTokens: b.output,
+      supportsXmlTags: true,
+      supportsImages,
+      name: displayId || 'cloud',
+    };
+  }
+
+  // Groq-hosted: split by size. Skipped for a gateway-routed id — a model reached
+  // through a LiteLLM/NIM proxy is NOT Groq-hosted, and Groq's tables are
+  // authoritative only for what Groq itself serves. Without this guard
+  // `litellm/qwen/qwen2.5-vl-72b` was claimed by isLargeGroqModel (any "qwen" +
+  // a 72b size) and answered with groqSupportsImages(), which is false for it —
+  // so a vision model came back supportsImages:false even with the hint above.
+  if (!isGatewayRouted && isLargeGroqModel(id)) {
+    const b = TIER_BUDGETS['cloud'];
+    return {
+      tier: 'cloud',
+      maxContextTokens: b.max,
+      promptBudgetTokens: b.system,
+      outputBudgetTokens: b.output,
+      supportsXmlTags: true,
+      supportsImages: groqSupportsImages(id),
+      name: displayId,
+    };
+  }
+
+  // Small Groq models (llama-3.1-8b-instant, gemma-7b, etc.). Gateway-routed ids
+  // are excluded for the same reason, and because this branch also drops the
+  // model to the 'tiny' prompt tier and an 8k context — a downgrade that should
+  // follow from where the model RUNS, not from a size in its name.
+  if (!isGatewayRouted && /\b(0\.5|1|2|3|4|7|8)b\b|\binstant\b/i.test(lower)) {
+    const b = TIER_BUDGETS['local-small'];
+    return {
+      tier: 'local-small',
+      maxContextTokens: b.max,
+      promptBudgetTokens: b.system,
+      outputBudgetTokens: b.output,
+      supportsXmlTags: false,
+      supportsImages: false,
+      name: displayId,
+    };
+  }
+
+  // Unknown -> conservative cloud assumption (custom providers are usually large hosted).
+  const b = TIER_BUDGETS['cloud'];
+  return {
+    tier: 'cloud',
+    maxContextTokens: b.max,
+    promptBudgetTokens: b.system,
+    outputBudgetTokens: b.output,
+    supportsXmlTags: true,
+    supportsImages: gatewayVisionHint,
+    name: displayId || 'unknown',
+  };
+}
+
+export function selectPromptTier(modelId: string, isOllama: boolean): PromptTier {
+  return getModelCapabilities(modelId, isOllama).tier === 'local-small' ? 'tiny' : 'full';
+}
+
+export function estimateTokens(text: string): number {
+  if (!text) return 0;
+  return Math.ceil(text.length / 4);
+}
+
+// Per-model max output (completion) token ceiling for the OpenAI Chat Completions
+// API. OpenAI rejects max_completion_tokens above a model's documented limit with
+// a 400 "max_tokens is too large" error (see issue #298: gpt-4o caps output at
+// 16384, so the global 65536 default failed on the very first request).
+//
+// Documented output caps (OpenAI docs, 2026-06):
+//   gpt-5 / 5.1 / 5.2 / 5.4 / 5.5 (+ -mini/-nano) → 128000
+//   o1 / o3 / o4 (+ -mini/-pro)                   → 100000
+//   gpt-4.1 (+ -mini)                             → 32768
+//   gpt-4o (+ -mini)                              → 16384
+//   gpt-4-turbo / gpt-4-vision / gpt-3.5-turbo    → 4096
+//   bare gpt-4 / 32k variants                     → 8192
+//   unknown OpenAI-compatible id                  → 16384 (conservative)
+// Every model gets an explicit cap so a future bump to the requested default
+// can't silently reintroduce the 400 on gpt-5.x / o-series.
+export function getOpenAiMaxOutput(modelId: string, requested: number): number {
+  const id = (modelId || '').toLowerCase();
+  let cap: number;
+  // gpt-6 (2026-09-30): OpenAI publishes no page for it that the docs index
+  // carries, and the key here has no credits to probe with. Grouped with gpt-5
+  // on the documented GPT-5.5 figure (128,000); the app's shared ceiling
+  // (MAX_OUTPUT_TOKENS, 65,536) is what is actually requested, which a gpt-6
+  // model would have to cap below 65,536 to reject.
+  if (/\bgpt-[56]/.test(id)) cap = 128000; // gpt-5.x / gpt-6.x families
+  else if (/\bo[1-9]\b/.test(id) || /\bo[1-9]-/.test(id)) cap = 100000; // o1/o3/o4 reasoners
+  else if (id.startsWith('gpt-4.1')) cap = 32768;
+  else if (id.startsWith('gpt-4o')) cap = 16384;
+  else if (id.startsWith('gpt-4-turbo') || id.startsWith('gpt-4-1106') || id.startsWith('gpt-4-0125') || id.startsWith('gpt-4-vision')) cap = 4096;
+  else if (id.startsWith('gpt-3.5')) cap = 4096;
+  else if (id.startsWith('gpt-4')) cap = 8192; // bare gpt-4 / 32k variants cap at 8192
+  else cap = 16384; // unknown OpenAI-compatible id — conservative but usable default
+  return Math.min(requested, cap);
+}
+
+/**
+ * Does this Claude model accept the sampling parameters (`temperature`,
+ * `top_p`, `top_k`)? Anthropic REMOVED them — a 400 if sent — on Opus 4.7 and
+ * later and on the Claude 5 families (Opus 5 / 5.5, Sonnet 5 / 5.5, Fable,
+ * Mythos), per the Claude API model reference (checked 2026-09-30).
+ *
+ * An allow-list of the families known to take them, not a block-list of the
+ * ones that don't: every model released since Opus 4.7 has dropped them, and
+ * OMITTING temperature is accepted by every Claude model, while SENDING it to
+ * one that rejects it fails every answer. Unknown and future ids omit.
+ */
+export function claudeAcceptsSamplingParams(modelId: string): boolean {
+  const id = (modelId || '').toLowerCase();
+  if (/^claude-(?:2|3|instant)/.test(id)) return true;
+  // Opus / Sonnet / Haiku 4.0-4.6, bare or with a date suffix. 4.7+ excluded.
+  return /^claude-(?:opus|sonnet|haiku)-4(?:-[0-6])?(?:-\d{8})?$/.test(id);
+}
+
+/**
+ * The `thinking` setting to send a NATIVE Claude model so it answers without
+ * thinking up front (low time-to-first-token), as a spread: `{ thinking }` or
+ * `{}`. Per Anthropic's per-model table (platform.claude.com/docs/en/
+ * build-with-claude/thinking, read 2026-10-01):
+ *
+ *   - `disabled` is accepted by Claude 3, Opus/Sonnet/Haiku 4.0–4.8, Sonnet 5,
+ *     and Opus 5 at `high` effort or below (Natively sets no effort; the
+ *     default is `high`).
+ *   - Sonnet 5.5 REJECTS `disabled` (400). Its lowest setting is
+ *     `between_tools` (up-front thinking off), accepted at its default effort.
+ *   - Opus 5.5, Fable 5 / 5.1 and Mythos reject `disabled` AND `between_tools`:
+ *     adaptive thinking is always on, and no field is the request they accept.
+ *
+ * An allow-list, for the same reason as claudeAcceptsSamplingParams: OMITTING
+ * the field is valid for every model, while sending a value a model rejects
+ * fails every answer — which is what `disabled` did to a selected Opus 5.5,
+ * Sonnet 5.5 or Fable before this. Unknown and future ids omit.
+ */
+export function claudeThinkingParam(modelId: string): { thinking?: { type: 'disabled' | 'between_tools' } } {
+  const id = (modelId || '').toLowerCase();
+  const disabled = /^claude-(?:2|3|instant)/.test(id)
+    // Opus / Sonnet / Haiku 4.0–4.8, bare or with a date suffix.
+    || /^claude-(?:opus|sonnet|haiku)-4(?:-[0-8])?(?:-\d{8})?$/.test(id)
+    // Opus 5 and Sonnet 5 exactly — not 5.5 (`claude-opus-5-5`).
+    || /^claude-(?:opus|sonnet)-5(?:-\d{8})?$/.test(id);
+  if (disabled) return { thinking: { type: 'disabled' } };
+  if (/^claude-sonnet-5-5(?:-\d{8})?$/.test(id)) return { thinking: { type: 'between_tools' } };
+  return {};
+}
+
+export type OpenAiReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
+// Lowest-latency *valid* reasoning_effort for an OpenAI reasoning model, or null
+// for non-reasoning models (gpt-4*, gpt-3.5) that reject the param entirely.
+//
+// The supported set differs per family and OpenAI dropped `minimal` after the
+// original gpt-5 line (see issue: gpt-5.4/5.5 reject `minimal` with a 400). We
+// pick a low-latency level the model actually accepts so TTFT stays low:
+//   - original gpt-5 / -mini / -nano      → minimal   (none not supported)
+//   - gpt-5.1 / 5.2 / 5.4 / 5.5 (chat)    → low       (minimal removed; low keeps light reasoning)
+//   - gpt-5-codex / gpt-5.x-codex         → low       (neither none nor minimal supported)
+//   - gpt-5-pro                           → high      (only high is accepted)
+//   - o1 / o3 / o4 (and -mini/-pro)       → low       (only low/medium/high)
+// Anything else (gpt-4*, custom proxies)  → null      (omit the param).
+/**
+ * Models LIVE-PROBED to accept `reasoning_effort: 'none'`, with the measured
+ * time-to-first-token it buys on a streaming What-to-Answer-shaped call
+ * (7 runs each except where noted, medians, 2026-09-22):
+ *
+ *   gpt-5.6-luna   low 1178 ms → none  798 ms   (-32%)
+ *   gpt-5.4-mini   low  823 ms → none  671 ms   (-18%)
+ *   gpt-5.5        low  864 ms → none  769 ms   (-11%, 5 runs)
+ *   gpt-5.4        low  912 ms → none  855 ms   (-6%)
+ *   gpt-5.4-nano   low  665 ms → none  697 ms   (within noise, 5 runs)
+ *
+ * `none` is the floor of the same lever `low` sits on — it removes the hidden
+ * reasoning pass that runs BEFORE the first visible token, which is the whole
+ * cost on a live answer. It is an ALLOW-LIST rather than a family rule for the
+ * same reason MINIMAL_THINKING_MODELS is one on the Gemini side: sending an
+ * effort a model rejects is a hard 400 on the interactive stream, not a slower
+ * answer ('minimal' is rejected by every id above — verified in the same run).
+ * Add an id only after probing it live.
+ */
+const NONE_REASONING_MODELS: ReadonlySet<string> = new Set<string>([
+  'gpt-5.6-luna',
+  'gpt-5.5',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'gpt-5.4-nano',
+]);
+
+/** True for a probed id, including its dated snapshots (`gpt-5.4-2026-01-01`). */
+function acceptsNoneReasoning(id: string): boolean {
+  if (NONE_REASONING_MODELS.has(id)) return true;
+  for (const m of NONE_REASONING_MODELS) {
+    if (id.startsWith(`${m}-20`)) return true;
+  }
+  return false;
+}
+
+export function getOpenAiReasoningEffort(modelId: string): OpenAiReasoningEffort | null {
+  const id = (modelId || '').toLowerCase();
+
+  // o-series reasoners: low/medium/high only.
+  if (/\bo[1-9]\b/.test(id) || /\bo[1-9]-/.test(id)) return 'low';
+
+  if (/\bgpt-5/.test(id)) {
+    if (id.includes('gpt-5-pro') || id.includes('gpt-5.1-pro') || id.includes('gpt-5.2-pro')) return 'high'; // pro: high only
+    if (id.includes('codex')) return 'low'; // codex variants: no none/minimal
+    // Original gpt-5 / gpt-5-mini / gpt-5-nano (NOT 5.1+) keep `minimal`.
+    if (/\bgpt-5(-mini|-nano)?(\b|-20)/.test(id) && !/\bgpt-5\.\d/.test(id)) return 'minimal';
+    // Probed to accept the floor: take it (see NONE_REASONING_MODELS).
+    if (acceptsNoneReasoning(id)) return 'none';
+    // Every other gpt-5.1+ id: `minimal` is removed and `none` is unprobed, so
+    // `low` remains the lowest value known to be accepted.
+    return 'low';
+  }
+
+  // gpt-4*, gpt-3.5, unknown — not a reasoning model; omit the param.
+  return null;
+}
+
+// Drop oldest turns until the joined transcript fits the token budget. Most recent turns are preserved.
+export function truncateTranscriptToFit(
+  transcript: TranscriptTurn[],
+  budgetTokens: number
+): TranscriptTurn[] {
+  if (!transcript?.length || budgetTokens <= 0) return transcript ?? [];
+  const total = (turns: TranscriptTurn[]) => turns.reduce((s, t) => s + estimateTokens(t.text) + 6, 0);
+  if (total(transcript) <= budgetTokens) return transcript;
+  const kept = [...transcript];
+  while (kept.length > 1 && total(kept) > budgetTokens) {
+    kept.shift();
+  }
+  return kept;
+}

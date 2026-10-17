@@ -1,0 +1,5092 @@
+
+import Database from 'better-sqlite3';
+import path from 'path';
+import os from 'os';
+import { app } from 'electron';
+import fs from 'fs';
+import * as sqliteVec from 'sqlite-vec';
+import { buildLegacySpaceCaseSql } from '../rag/embeddingSpace';
+import { decodeUsageMetadata, encodeUsageMetadata } from './usageMetadata';
+import { encodeSavedOrigin, decodeSavedOrigin } from '../intelligence/savedTranscriptOrigin';
+import { parseVecTableName, readPendingVecRebuilds, writePendingVecRebuilds, type PendingVecRebuild } from './vecRebuildPending';
+import { prepareVecRowWriter } from './vecRowWrite';
+import { ensureOrganiseSchema, ORGANISE_TABLES } from './organiseSchema';
+import { runObservedMeetingDelete } from './meetingDeleteObservers';
+import type { ActionItem, DecisionItem, FollowUpDraft, MeetingSummaryGenerationMeta, MeetingSummaryModeMeta, MeetingSummarySectionV3, NoteBlock, PersonMention, QuestionItem, RiskItem, SourceQualityMeta, SpeakerLabelMap, SummaryStatus, TimelineItem } from '../services/meeting/types';
+
+// Interfaces for our data objects
+export interface Meeting {
+    id: string;
+    title: string;
+    date: string; // ISO string
+    duration: string;
+    summary: string;
+    detailedSummary?: {
+        overview?: string;
+        actionItems: string[];
+        keyPoints: string[];
+        actionItemsTitle?: string;
+        keyPointsTitle?: string;
+        sections?: Array<{ title: string; bullets: string[] }>;
+        schemaVersion?: number;
+        tldr?: string[];
+        whatChanged?: string[];
+        decisions?: DecisionItem[];
+        openQuestions?: QuestionItem[];
+        risks?: RiskItem[];
+        sourceQuality?: SourceQualityMeta;
+        timeline?: TimelineItem[];
+        people?: PersonMention[];
+        topics?: string[];
+        recipes?: Record<string, string>;
+        noteBlocks?: NoteBlock[];
+        sectionsV3?: MeetingSummarySectionV3[];
+        mode?: MeetingSummaryModeMeta;
+        generation?: MeetingSummaryGenerationMeta;
+        actionItemsStructured?: Array<{ id: string; text: string; owner?: string; deadline?: string; sourceTimestamp?: number }>;
+        actionItemsV3?: ActionItem[];
+        // V3 follow-up is a structured FollowUpDraft object; legacy rows stored a plain string.
+        followUpDraft?: FollowUpDraft | string;
+        speakerLabels?: SpeakerLabelMap;
+        crossMeeting?: { carriedOpenQuestions?: Array<{ text: string; fromMeetingId: string; fromTitle: string }>; recurringRisks?: Array<{ text: string; fromMeetingId: string; fromTitle: string }>; stillOpen?: string[] };
+        coachingInsights?: Array<{ id: string; type: string; title: string; detail: string; severity: 'info' | 'opportunity' | 'warning'; evidence?: string }>;
+    };
+    transcript?: Array<{
+        speaker: string;
+        text: string;
+        timestamp: number;
+        /** Which of the other side's voices said it (speaker_2…), when known; see speaker_id. */
+        speakerId?: string;
+        /** Where the line came from (SessionTracker.TranscriptOrigin): 'stt' is
+         *  speech, 'manual_chat' is typed to the assistant, 'assistant' is the
+         *  assistant's own output. Absent on meetings saved before 2026-10-04. */
+        origin?: string;
+        /** An assistant line that answers typed chat (not a live suggestion). */
+        chatReply?: boolean;
+    }>;
+    usage?: Array<{
+        type: 'assist' | 'followup' | 'chat' | 'followup_questions';
+        timestamp: number;
+        question?: string;
+        answer?: string;
+        items?: string[];
+        /** JPEG data-URL previews of the screenshots the answer used (usagePreviews.ts). */
+        images?: string[];
+    }>;
+    calendarEventId?: string;
+    /**
+     * The calendar event as it was when the meeting was linked to it
+     * (calendarSessionMatch.ts CalendarEventSnapshot): title, times, link and
+     * attendees. Kept with the meeting because the calendar API only lists
+     * events that haven't ended; a follow-up written after the call needs them.
+     */
+    calendarEvent?: import('../services/calendar/calendarSessionMatch').CalendarEventSnapshot;
+    source?: 'manual' | 'calendar';
+    isProcessed?: boolean;
+    summaryStatus?: SummaryStatus;
+    /**
+     * What a recovery needs to write this meeting's notes as Stop would have
+     * (MeetingRecoveryMeta: calendar title, the call's speaking record, the
+     * mode, the true start). Saved with an unprocessed meeting, cleared by the
+     * processed save. Write-only through saveMeeting; read by getMeetingRecoveryMeta.
+     */
+    recoveryMeta?: unknown;
+    /**
+     * What the user typed in the notes window during the meeting (2026-10-15),
+     * exactly as typed. Its own column (user_notes), not inside summary_json:
+     * Regenerate replaces the notes blob and must never take the user's own
+     * words with it. saveMeeting writes it only when given.
+     */
+    userNotes?: string | null;
+}
+
+/**
+ * CR-06: marks the v28 page-count DATA repair as still owed. It is deliberately
+ * NOT the schema `user_version`: the repair changes no schema, so a failure must
+ * not hold later SCHEMA migrations (notably v29's vec0 cosine rebuild) hostage.
+ */
+const PAGE_COUNT_REPAIR_PENDING_KEY = 'pending_page_count_repair';
+
+/** A stored calendar_event_json, or undefined for none or anything malformed. */
+function parseCalendarEvent(json: unknown): Meeting['calendarEvent'] {
+    if (typeof json !== 'string' || !json) return undefined;
+    try {
+        const value = JSON.parse(json);
+        return value && typeof value === 'object' && typeof value.id === 'string' && Array.isArray(value.attendees) ? value : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+export class DatabaseManager {
+    private static instance: DatabaseManager;
+    private db: Database.Database | null = null;
+    private dbPath: string;
+    private resolvedExtPath: string = '';
+    private initError: Error | null = null;
+
+    private constructor() {
+        // Resolve the userData directory. Normally this is Electron's real
+        // per-user app-data path. But under `ELECTRON_RUN_AS_NODE=1` (the
+        // `test:electron` runner) or before `app` is ready, `app` may be
+        // undefined or `app.getPath` may throw — in those contexts fall back
+        // to an explicit override (NATIVELY_TEST_USERDATA) or an OS-temp dir
+        // so importing a module that lazily constructs DatabaseManager (e.g.
+        // ModesManager.getInstance() inside a unit test) degrades gracefully
+        // instead of crashing with "Cannot read properties of undefined
+        // (reading 'getPath')". Production (real Electron main process) is
+        // unaffected — app.getPath succeeds and this fallback never runs.
+        let userDataPath: string;
+        try {
+            const fromEnv = process.env.NATIVELY_TEST_USERDATA;
+            if (fromEnv) {
+                userDataPath = fromEnv;
+            } else if (app && typeof app.getPath === 'function') {
+                userDataPath = app.getPath('userData');
+            } else {
+                userDataPath = path.join(os.tmpdir(), 'natively-no-electron-app');
+            }
+        } catch {
+            userDataPath = path.join(os.tmpdir(), 'natively-no-electron-app');
+        }
+        try { fs.mkdirSync(userDataPath, { recursive: true }); } catch { /* best effort */ }
+        this.dbPath = path.join(userDataPath, 'natively.db');
+        // IMPORTANT: never throw out of the constructor. If init() throws and
+        // escapes, `DatabaseManager.instance` is never assigned — so every
+        // subsequent getInstance() call re-enters the constructor and re-emits
+        // the identical failure (this is why a single dlopen error used to print
+        // as a wall of ~dozens of identical stack traces across seed-demo,
+        // get-recent-meetings, modes:get-active, etc.). Instead we capture the
+        // error once and degrade to db: null; every public method already guards
+        // with `if (!this.db)`, so callers get empty/null results, not throws.
+        try {
+            this.init();
+        } catch (error) {
+            this.initError = error as Error;
+            this.reportInitFailure(error);
+        }
+    }
+
+    public static getInstance(): DatabaseManager {
+        if (!DatabaseManager.instance) {
+            DatabaseManager.instance = new DatabaseManager();
+        }
+        return DatabaseManager.instance;
+    }
+
+    /** True when the underlying SQLite database opened successfully. */
+    public isAvailable(): boolean {
+        return this.db !== null;
+    }
+
+    /**
+     * Truncate the WAL file by running a `PRAGMA wal_checkpoint(TRUNCATE)`.
+     * On a force-quit or a crash mid-write, the `-wal` file is left in an
+     * inconsistent state and the next launch's `new Database(dbPath)` may
+     * either hang on a kernel lock the OS thinks is held, or read partial
+     * committed data. This call is best-effort: if it fails (db is null or
+     * the connection is closed) it does nothing. Should be called from
+     * `before-quit` AND from any force-quit-handler path so a SIGKILL of
+     * the Electron main process is the ONLY way the WAL stays dirty.
+     *
+     * This is the missing piece for the "fresh-profile crash, never opens
+     * again" bug: a half-written .db-wal on a brand-new install would lock
+     * the next launch's `new Database(dbPath)` against a phantom lock.
+     */
+    public checkpoint(): void {
+        if (!this.db) return;
+        try {
+            this.db.pragma('wal_checkpoint(TRUNCATE)');
+        } catch (e: any) {
+            // best-effort: a checkpoint failure should not block shutdown.
+            console.warn('[DatabaseManager] wal_checkpoint(TRUNCATE) failed:', e?.message || e);
+        }
+    }
+
+    /**
+     * Close the better-sqlite3 connection cleanly. After this, all public
+     * methods are no-ops (db is null). Idempotent. Safe to call from
+     * `before-quit` AND from the `window-all-closed` handler so the
+     * launcher hides-to-tray path also releases the connection.
+     *
+     * This path DOES checkpoint (TRUNCATE) because it runs from a HEALTHY
+     * process (clean quit). Do NOT call this from a crash handler — use
+     * `closeWithoutCheckpoint()` there instead (see below).
+     */
+    public close(): void {
+        this.cancelScheduledVecRebuilds();
+        if (!this.db) return;
+        try {
+            this.db.pragma('wal_checkpoint(TRUNCATE)');
+        } catch { /* best-effort */ }
+        try {
+            this.db.close();
+        } catch (e: any) {
+            console.warn('[DatabaseManager] close failed:', e?.message || e);
+        }
+        this.db = null;
+    }
+
+    /**
+     * Crash-safe close: release the connection WITHOUT running a
+     * wal_checkpoint(TRUNCATE).
+     *
+     * REGRESSION FIX (2026-07-10): v2.8.1 wired an emergency
+     * checkpoint+close into every crash handler (uncaughtException,
+     * unhandledRejection, SIGTERM/SIGINT, render-process-gone, …). But a
+     * TRUNCATE checkpoint run from a CRASHING or half-initialized process
+     * — or interrupted by the macOS SIGTERM→SIGKILL race — can leave
+     * `natively.db-wal` / `natively.db-shm` half-truncated, which then
+     * BLOCKS the next `new Database()` open (SQLITE_BUSY on Windows'
+     * mandatory locks, or an unreconcilable WAL on macOS). That converted a
+     * one-time crash into a permanent "app never boots again" brick on both
+     * platforms. v2.7.0 never checkpointed on crash — it let SQLite's own
+     * automatic WAL recovery replay the log safely on the next open, which
+     * is exactly what we restore here.
+     *
+     * So on a crash we ONLY close the handle (to drop the OS lock) and let
+     * SQLite auto-recover the WAL next launch. `better_sqlite3`'s `close()`
+     * itself does NOT checkpoint (only our `close()` wrapper above does), so
+     * calling the raw handle close is checkpoint-free.
+     */
+    public closeWithoutCheckpoint(): void {
+        this.cancelScheduledVecRebuilds();
+        if (!this.db) return;
+        try {
+            this.db.close();
+        } catch (e: any) {
+            console.warn('[DatabaseManager] closeWithoutCheckpoint failed:', e?.message || e);
+        }
+        this.db = null;
+    }
+
+    /**
+     * The error that caused initialization to fail, if any. Lets the app surface
+     * a single user-facing banner (e.g. "Local database unavailable — meeting
+     * history disabled") instead of relying on log scraping.
+     */
+    public getInitError(): Error | null {
+        return this.initError;
+    }
+
+    /**
+     * Translate an init failure into a single, actionable log line. The most
+     * common fatal cause is a native-module architecture mismatch (an x86_64
+     * better-sqlite3 binary loaded under the arm64 Electron runtime, typically
+     * produced by an `npm install` that ran under a Rosetta shell).
+     */
+    private reportInitFailure(error: unknown): void {
+        // better-sqlite3 loads through the `bindings` package, which SWALLOWS the
+        // real dlopen error at each candidate path and then reports
+        // "Could not locate the bindings file. Tried: …" — a message that names a
+        // MISSING file even when the file is present and merely unloadable. The
+        // previous /incompatible architecture|ERR_DLOPEN_FAILED|mach-o/i test
+        // therefore never matched the most common genuine cause, so users hit the
+        // generic branch and never saw the rebuild guidance. See
+        // electron/lib/bindingFailure.cjs for the evidence.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { diagnoseBindingFailure } = require('../lib/bindingFailure.cjs');
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { binaryArch } = require('../lib/nativeArch.cjs');
+
+        let diagnosis: { kind: string; path?: string; actual?: string; expected?: string; tried?: string[] };
+        try {
+            diagnosis = diagnoseBindingFailure(error, {
+                exists: (p: string) => fs.existsSync(p),
+                archOf: (p: string) => binaryArch(p),
+                processArch: process.arch,
+            });
+        } catch {
+            // Diagnosis must never be the thing that breaks startup reporting.
+            diagnosis = { kind: 'other' };
+        }
+
+        if (diagnosis.kind === 'arch-mismatch') {
+            const where = diagnosis.path ? `\n  Offending binary: ${diagnosis.path}` : '';
+            const what = diagnosis.actual
+                ? ` (binary is ${diagnosis.actual}, this app is ${diagnosis.expected})`
+                : '';
+            console.error(
+                '[DatabaseManager] FATAL: native module (better-sqlite3) failed to load — the compiled ' +
+                `binary architecture does not match the Electron runtime${what}. Local database is DISABLED ` +
+                '(meeting history, modes, and notes will not persist this session).' + where + '\n' +
+                '  Fix: run `npm run rebuild:native` from a native (non-Rosetta) terminal, then restart the app.\n' +
+                '  If this is an INSTALLED app (not a dev checkout), you have the wrong build for your Mac — ' +
+                'download the arm64 DMG on Apple Silicon, or the standard DMG on Intel.'
+            );
+        } else if (diagnosis.kind === 'binding-missing') {
+            // Every candidate path was genuinely absent: a packaging/installation
+            // fault, NOT something a rebuild fixes. Saying "rebuild" here would send
+            // users down the wrong path.
+            console.error(
+                '[DatabaseManager] FATAL: native module (better-sqlite3) is MISSING from this build — no ' +
+                'binary exists at any of the paths it was looked for. Local database is DISABLED ' +
+                '(meeting history, modes, and notes will not persist this session).\n' +
+                `  Searched ${diagnosis.tried?.length ?? 0} path(s); first: ${diagnosis.tried?.[0] ?? 'n/a'}\n` +
+                '  This is an installation/packaging fault — reinstall the app.'
+            );
+        } else {
+            console.error(
+                '[DatabaseManager] FATAL: database initialization failed. Local database is DISABLED ' +
+                '(meeting history, modes, and notes will not persist this session).',
+                error
+            );
+        }
+    }
+
+    /**
+     * Open the better-sqlite3 connection, self-healing a poisoned WAL sidecar
+     * left by an unclean prior exit / interrupted crash-time checkpoint.
+     *
+     * On the first open failure whose code indicates lock contention or a torn
+     * WAL (SQLITE_BUSY / SQLITE_IOERR / SQLITE_CORRUPT / SQLITE_NOTADB /
+     * SQLITE_CANTOPEN / SQLITE_PROTOCOL), delete the `-wal` and `-shm` sidecars
+     * (NOT the main `.db`, which holds the last committed state) and retry the
+     * open exactly once. If the retry also fails, the original error propagates
+     * so the ctor's catch degrades to `db: null` (meeting history/modes
+     * disabled) instead of hanging — same as before, but only as a last resort.
+     *
+     * See the REGRESSION FIX note on closeWithoutCheckpoint() for the root cause.
+     */
+    private openWithWalSelfHeal(): Database.Database {
+        try {
+            return new Database(this.dbPath);
+        } catch (openErr: any) {
+            const code = String(openErr?.code || '');
+            const healable =
+                /SQLITE_BUSY|SQLITE_IOERR|SQLITE_CORRUPT|SQLITE_NOTADB|SQLITE_CANTOPEN|SQLITE_PROTOCOL/.test(code) ||
+                /database is locked|disk I\/O error|file is not a database|malformed/i.test(String(openErr?.message || ''));
+            if (!healable) throw openErr;
+
+            console.warn(
+                `[DB-RECOVERY] initial open failed (${code || openErr?.message}); ` +
+                `clearing stale WAL sidecars (-wal/-shm) and retrying once. ` +
+                `This recovers an install bricked by an interrupted crash-time checkpoint.`
+            );
+            for (const suffix of ['-wal', '-shm'] as const) {
+                const sidecar = `${this.dbPath}${suffix}`;
+                try {
+                    if (fs.existsSync(sidecar)) {
+                        fs.unlinkSync(sidecar);
+                        console.warn(`[DB-RECOVERY] removed stale ${suffix} sidecar at ${sidecar}`);
+                    }
+                } catch (rmErr: any) {
+                    // If we cannot remove the sidecar (permissions, or a zombie
+                    // process still holds the handle on Windows), the retry will
+                    // fail and the original error propagates. Log and continue.
+                    console.warn(`[DB-RECOVERY] could not remove ${suffix} sidecar: ${rmErr?.message || rmErr}`);
+                }
+            }
+            // Retry ONCE. Let any error here propagate to the ctor catch.
+            const db = new Database(this.dbPath);
+            console.warn('[DB-RECOVERY] reopened successfully after clearing WAL sidecars ✅');
+            return db;
+        }
+    }
+
+    private init() {
+        try {
+            console.log(`[DatabaseManager] Initializing database at ${this.dbPath}`);
+            // Ensure directory exists (though userData usually does)
+            const dir = path.dirname(this.dbPath);
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+                console.log(`[DatabaseManager] Created directory: ${dir}`);
+            } else {
+                console.log(`[DatabaseManager] Directory exists: ${dir}`);
+                try {
+                    const files = fs.readdirSync(dir);
+                    console.log(`[DatabaseManager] Directory contents:`, files);
+                    const dbExists = fs.existsSync(this.dbPath);
+                    if (dbExists) {
+                        const stats = fs.statSync(this.dbPath);
+                        console.log(`[DatabaseManager] Found existing DB. Size: ${stats.size} bytes`);
+                    } else {
+                        console.log(`[DatabaseManager] No existing DB found at ${this.dbPath}. Creating new one.`);
+                    }
+                } catch (e) {
+                    console.error('[DatabaseManager] Error checking directory/file:', e);
+                }
+            }
+
+            // SELF-HEAL (2026-07-10): open the DB, and if the open fails
+            // because a prior crash left a poisoned WAL sidecar, clear the
+            // stale -wal/-shm and retry ONCE. Background: v2.8.1 ran a
+            // wal_checkpoint(TRUNCATE) from crash handlers; if that was
+            // interrupted it left natively.db-wal/-shm in a state that made
+            // this very open throw (SQLITE_BUSY on Windows' mandatory locks,
+            // SQLITE_IOERR/CORRUPT/NOTADB on a torn WAL) — permanently bricking
+            // every subsequent launch. The main .db holds the last COMMITTED
+            // state; a dirty/uncheckpointed WAL only contains not-yet-merged
+            // frames, so deleting the sidecars and reopening recovers the DB to
+            // its last consistent commit rather than leaving the app unbootable.
+            // Any user already bricked by a shipped v2.8.x build self-heals on
+            // the next launch with this — they do NOT need to hand-delete files.
+            this.db = this.openWithWalSelfHeal();
+            this.db.pragma('journal_mode = WAL');
+            // Hotfix 2026-07-09: with WAL enabled, background indexing workers
+            // and foreground chat reads/writes can briefly contend. Waiting is
+            // safer than throwing SQLITE_BUSY during startup or active sessions.
+            this.db.pragma('busy_timeout = 5000');
+            // Enforce foreign keys on the shared connection. Several delete paths
+            // (deleteMeeting, deleteMode, deleteKnowledgePack) do a bare parent-row
+            // DELETE and rely ENTIRELY on `ON DELETE CASCADE` to reap child rows
+            // (transcripts, ai_interactions, chunks, chunk_summaries). SQLite ships
+            // with foreign_keys OFF per-connection, so those cascades are inert
+            // unless something enables the pragma. Historically the ONLY place that
+            // did was the premium KnowledgeDatabaseManager's constructor — meaning
+            // FK enforcement silently depended on the premium module loading. If
+            // premium failed to load (source-available build, packaging regression),
+            // every meeting/mode/pack delete would orphan its children. Enable it
+            // here, unconditionally, on the one shared connection all writes use.
+            // Must run OUTSIDE any transaction (SQLite no-ops `foreign_keys` if set
+            // mid-transaction) and BEFORE migrations — both hold here.
+            this.db.pragma('foreign_keys = ON');
+            // synchronous is left at better-sqlite3's build default, which in
+            // WAL mode is NORMAL (SQLITE_DEFAULT_WAL_SYNCHRONOUS=1), not FULL:
+            // commits are synced at checkpoints, so a power loss can drop the
+            // latest ones (checked 2026-10-15). The emergency-close path added in
+            // electron/main.ts (uncaughtException / SIGTERM / process-gone)
+            // checkpoint+closes the DB so the next launch never sees a stale
+            // WAL holding a kernel lock from a dead writer.
+
+            // 2026-07-09: detect crash-recovery conditions on startup. If we
+            // see a WAL file > 50MB or a `-wal` left over from a hard kill,
+            // log it so the user can correlate a slow/stuck launch with the
+            // previous session's crash. Anything >5MB after a clean previous
+            // session is unusual and worth surfacing; >50MB is "the previous
+            // session probably wrote a lot without checkpointing".
+            try {
+                const walPath = `${this.dbPath}-wal`;
+                const shmPath = `${this.dbPath}-shm`;
+                const walBytes = fs.existsSync(walPath) ? fs.statSync(walPath).size : 0;
+                const shmExists = fs.existsSync(shmPath);
+                if (walBytes >= 50 * 1024 * 1024) {
+                    console.warn(`[DB-RECOVERY] large WAL on open: ${walBytes} bytes at ${walPath} (previous session likely died mid-transaction). SQLite will auto-recover it on this open; a manual TRUNCATE checkpoint runs only on the next clean quit.`);
+                } else if (walBytes >= 5 * 1024 * 1024) {
+                    console.log(`[DB-RECOVERY] non-trivial WAL on open: ${walBytes} bytes at ${walPath}`);
+                }
+                if (shmExists) {
+                    console.log(`[DB-RECOVERY] -shm index file present (typical after WAL-mode open; SQLite manages it).`);
+                }
+            } catch (recovErr: any) {
+                // Recovery detection is best-effort — never block startup.
+                console.warn('[DB-RECOVERY] detection check failed (non-fatal):', recovErr?.message || recovErr);
+            }
+
+            // Load sqlite-vec extension for native vector search
+            try {
+                // 1. sqlite-vec's getLoadablePath() returns a path inside app.asar
+                //    (e.g. .../app.asar/node_modules/sqlite-vec-darwin-arm64/vec0.dylib)
+                //    but dlopen() needs real files on disk, not files inside the asar archive.
+                //    electron-builder's asarUnpack puts them in app.asar.unpacked instead.
+                // 2. better-sqlite3's loadExtension() auto-appends the platform extension
+                //    (.dylib/.so/.dll), so we strip it to avoid vec0.dylib.dylib.
+                let extPath = sqliteVec.getLoadablePath();
+                extPath = extPath.replace('app.asar', 'app.asar.unpacked');
+                extPath = extPath.replace(/\.(dylib|so|dll)$/, '');
+                this.db.loadExtension(extPath);
+                this.resolvedExtPath = extPath; // Store for worker thread access
+                console.log('[DatabaseManager] sqlite-vec extension loaded successfully');
+            } catch (extErr) {
+                console.error('[DatabaseManager] Failed to load sqlite-vec extension:', extErr);
+                console.warn('[DatabaseManager] Vector search will fall back to JS cosine similarity');
+            }
+
+            this.runMigrations();
+            this.repairVecTables();
+            this.scheduleVecRebuilds();
+            // After the migrations (it alters `meetings`); not version-gated.
+            this.ensureLiveMeetingSchema();
+            this.ensureMeetingNotesSchema();
+            // Folders, tags, people, companies (organiseSchema.ts). Same rule:
+            // idempotent and not behind user_version.
+            ensureOrganiseSchema(this.db);
+        } catch (error) {
+            console.error('[DatabaseManager] Failed to initialize database:', error);
+            throw error;
+        }
+    }
+
+    // ============================================
+    // PRAGMA user_version Migration System
+    // ============================================
+    // Each version is applied exactly once, in order.
+    // New migrations append a new `if (version < N)` block.
+    // ============================================
+
+    /**
+     * Ensure the reserved '__profile_okf__' mode row exists.
+     *
+     * APPLIED UNCONDITIONALLY ON EVERY BOOT, NOT VERSION-GATED (live defect,
+     * 2026-09-13). This INSERT used to live inside the `version < 23` block. A
+     * live profile was observed at user_version 31 carrying v23's `pii` column
+     * but NOT this row, so the gate could never run again and the row could
+     * never come back. Every profile Knowledge Pack write then failed the
+     * knowledge_sources.mode_id -> modes(id) foreign key with "FOREIGN KEY
+     * constraint failed", and because ProfilePackBuilder.generateForProfile
+     * deliberately swallows its own errors (the OKF layer must never fail an
+     * ingest), ingest kept reporting success while the profile card layer
+     * silently never persisted a single row.
+     *
+     * `INSERT OR IGNORE` is idempotent by construction — the same reasoning as
+     * the meetings.user_titled ALTER further down — so it must not depend on a
+     * counter that concurrent branches can race or that a one-shot can strand.
+     * Running it every boot also self-heals any database already in that state.
+     *
+     * Safe to call from anywhere after migration v11 created `modes`; it is
+     * invoked from runMigrations immediately after the v23 block.
+     */
+    private ensureProfileOkfSentinelMode(): void {
+        if (!this.db) return;
+        try {
+            const result = this.db.prepare(`
+                INSERT OR IGNORE INTO modes (id, name, template_type, custom_context, is_active, created_at)
+                VALUES ('__profile_okf__', 'Profile Intelligence (reserved)', '__reserved__', '', 0, CURRENT_TIMESTAMP)
+            `).run();
+            if (result.changes > 0) {
+                console.log('[DatabaseManager] Restored the reserved __profile_okf__ mode row (profile Knowledge Packs could not persist without it)');
+            }
+        } catch (e) {
+            // Never fatal: without the sentinel, profile OKF packs stay broken
+            // (the pre-fix status quo), but every other table still works, so a
+            // failure here must not take the whole boot down with it.
+            console.error('[DatabaseManager] Failed to ensure the reserved __profile_okf__ mode row:', (e as Error)?.message || e);
+        }
+    }
+
+    private runMigrations() {
+        if (!this.db) return;
+
+        const version = (this.db.pragma('user_version', { simple: true }) as number) || 0;
+        console.log(`[DatabaseManager] Current schema version: ${version}`);
+
+        // Version 0 → 1: Initial schema (all core tables)
+        if (version < 1) {
+            console.log('[DatabaseManager] Applying migration v0 → v1: Initial schema');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS meetings (
+                    id TEXT PRIMARY KEY,
+                    title TEXT,
+                    start_time INTEGER,
+                    duration_ms INTEGER,
+                    summary_json TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    calendar_event_id TEXT,
+                    source TEXT,
+                    is_processed INTEGER DEFAULT 1,
+                    summary_status TEXT DEFAULT 'completed'
+                );
+
+                CREATE TABLE IF NOT EXISTS transcripts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT,
+                    speaker TEXT,
+                    content TEXT,
+                    timestamp_ms INTEGER,
+                    FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS ai_interactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT,
+                    type TEXT,
+                    timestamp INTEGER,
+                    user_query TEXT,
+                    ai_response TEXT,
+                    metadata_json TEXT,
+                    FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    speaker TEXT,
+                    start_timestamp_ms INTEGER,
+                    end_timestamp_ms INTEGER,
+                    cleaned_text TEXT NOT NULL,
+                    token_count INTEGER NOT NULL,
+                    embedding BLOB,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS chunk_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT NOT NULL UNIQUE,
+                    summary_text TEXT NOT NULL,
+                    embedding BLOB,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS embedding_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id TEXT NOT NULL,
+                    chunk_id INTEGER,
+                    status TEXT DEFAULT 'pending',
+                    retry_count INTEGER DEFAULT 0,
+                    error_message TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    processed_at TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_chunks_meeting ON chunks(meeting_id);
+
+                CREATE TABLE IF NOT EXISTS user_profile (
+                    id INTEGER PRIMARY KEY,
+                    structured_json TEXT NOT NULL,
+                    compact_persona TEXT NOT NULL,
+                    intro_short TEXT,
+                    intro_interview TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS resume_nodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT,
+                    title TEXT,
+                    organization TEXT,
+                    start_date TEXT,
+                    end_date TEXT,
+                    duration_months INTEGER,
+                    text_content TEXT,
+                    tags TEXT,
+                    embedding BLOB
+                );
+            `);
+            this.db.pragma('user_version = 1');
+        }
+
+        // Version 1 → 2: Add columns for existing installs (safe for fresh installs too)
+        if (version < 2) {
+            console.log('[DatabaseManager] Applying migration v1 → v2: Add meetings columns');
+            // For fresh installs these columns already exist from v1, so we guard with try/catch.
+            // Unlike the old code, these are versioned and run exactly once.
+            const columnsToAdd = [
+                "ALTER TABLE meetings ADD COLUMN calendar_event_id TEXT",
+                "ALTER TABLE meetings ADD COLUMN source TEXT",
+                "ALTER TABLE meetings ADD COLUMN is_processed INTEGER DEFAULT 1"
+            ];
+            for (const sql of columnsToAdd) {
+                try { this.db.exec(sql); } catch (e) { /* Column already exists from v1 CREATE */ }
+            }
+            this.db.pragma('user_version = 2');
+        }
+
+        // Version 2 → 3: sqlite-vec virtual tables for native vector search
+        if (version < 3) {
+            // PHASE-2D (Fix-2): the historical v3 step attempted to create
+            // a vec0 table with `embedding float` (no dimension), which
+            // sqlite-vec rejects with "At least one vector column is
+            // required". The fix is to skip that broken CREATE entirely
+            // and let the v8/v9 per-dimension migration below provision
+            // the working tables. We still bump user_version to 3 so the
+            // migration loop advances normally.
+            //
+            // The happy path (fresh install) is now COMPLETELY SILENT —
+            // no log line, no error. We only log when there's actual
+            // legacy cleanup to report (a prior install that DID create
+            // the broken tables).
+            try {
+                this.tryProvisionLegacyVecTables();
+                if (this._lastLegacyCleanup > 0) {
+                    console.log(`[DatabaseManager] v3 migration: cleared ${this._lastLegacyCleanup} legacy broken vec0 table(s) (replaced by per-dim v8/v9)`);
+                    this._lastLegacyCleanup = 0;
+                }
+            } catch (e) {
+                // Only log on ACTUAL failure, not on the historic "vec0
+                // constructor error: At least one vector column is
+                // required" which we now explicitly do NOT raise.
+                console.error('[DatabaseManager] v3 migration failed unexpectedly (non-fatal, will be retried at v8/v9):', (e as { message?: string })?.message || e);
+            }
+            this.db.pragma('user_version = 3');
+        }
+
+        // Version 3 → 4: Drop strict 768-dim vec0 tables to allow flexible embedding dimensions
+        if (version < 4) {
+            // PHASE-2D (Fix-2): same fix as v3 — silent on fresh installs.
+            // The only action this step used to take was DROP TABLE on
+            // tables that v3 just CREATED. Since v3 no longer creates
+            // them, and legacy repos already had them dropped in v3,
+            // there's nothing to do on the happy path.
+            try {
+                this.tryProvisionLegacyVecTables();
+                if (this._lastLegacyCleanup > 0) {
+                    console.log(`[DatabaseManager] v4 migration: cleared ${this._lastLegacyCleanup} legacy broken vec0 table(s)`);
+                    this._lastLegacyCleanup = 0;
+                }
+            } catch (e) {
+                console.error('[DatabaseManager] v4 migration failed (non-fatal):', (e as { message?: string })?.message || e);
+            }
+            this.db.pragma('user_version = 4');
+        }
+
+        // Version 4 → 5: Add embedding provider and dimensions columns
+        if (version < 5) {
+            console.log('[DatabaseManager] Applying migration v4 → v5: Add embedding provider/dimensions columns');
+            const columnsToAdd = [
+                "ALTER TABLE meetings ADD COLUMN embedding_provider TEXT",
+                "ALTER TABLE meetings ADD COLUMN embedding_dimensions INTEGER"
+            ];
+            for (const sql of columnsToAdd) {
+                try { this.db.exec(sql); } catch (e) { /* Column already exists */ }
+            }
+            this.db.pragma('user_version = 5');
+        }
+
+        // Version 5 → 6: Add app_state table for KV storage (Ollama pull state, etc)
+        if (version < 6) {
+            console.log('[DatabaseManager] Applying migration v5 → v6: Add app_state table');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+            `);
+            this.db.pragma('user_version = 6');
+        }
+
+        // Version 6 → 7: Add indexes on transcripts and ai_interactions meeting_id
+        // (Previously missing — causes O(N) full-table scans when fetching meeting details)
+        if (version < 7) {
+            console.log('[DatabaseManager] Applying migration v6 → v7: Add meeting_id indexes');
+            try {
+                this.db.exec('CREATE INDEX IF NOT EXISTS idx_transcripts_meeting ON transcripts(meeting_id);');
+                this.db.exec('CREATE INDEX IF NOT EXISTS idx_ai_interactions_meeting ON ai_interactions(meeting_id, timestamp);');
+                console.log('[DatabaseManager] Meeting ID indexes created successfully');
+            } catch (e) {
+                console.error('[DatabaseManager] Failed to create indexes (non-fatal):', e);
+            }
+            this.db.pragma('user_version = 7');
+        }
+
+        // Version 7 → 8: Provision per-dimension vec0 tables (NOTE: this v8 ran in two broken
+        // iterations for some users — first with float[1536] single table, then with correct per-dim
+        // tables. The v9 migration below corrects any v8 that used the old broken schema.)
+        if (version < 8) {
+            console.log('[DatabaseManager] Applying migration v7 → v8: Provision per-dimension vec0 tables');
+            // Drop the legacy single-dim tables from v3/v4 if they exist and are unusable
+            try { this.db.exec('DROP TABLE IF EXISTS vec_chunks;'); } catch (_) {}
+            try { this.db.exec('DROP TABLE IF EXISTS vec_summaries;'); } catch (_) {}
+
+            for (const dim of DatabaseManager.KNOWN_DIMS) {
+                this.ensureVecTableForDim(dim);
+            }
+            console.log('[DatabaseManager] v8 migration: per-dimension vec0 tables provisioned');
+            this.db.pragma('user_version = 8');
+        }
+
+        // Version 8 → 9: Ensure per-dimension tables exist.
+        // Required for DBs already at v8 but with the old broken float[1536] single-table schema,
+        // or with the first incorrect v8 migration that didn't provision KNOWN_DIMS tables.
+        if (version < 9) {
+            console.log('[DatabaseManager] Applying migration v8 → v9: Ensure per-dimension vec0 tables exist');
+            // Drop old single-dim orphan tables if they exist (float[1536] schema)
+            try { this.db.exec('DROP TABLE IF EXISTS vec_chunks;'); } catch (_) {}
+            try { this.db.exec('DROP TABLE IF EXISTS vec_summaries;'); } catch (_) {}
+
+            let allOk = true;
+            for (const dim of DatabaseManager.KNOWN_DIMS) {
+                this.ensureVecTableForDim(dim);
+                // Verify the table actually exists after provisioning
+                try {
+                    this.db.prepare(`SELECT count(*) FROM vec_chunks_${dim} LIMIT 1`).get();
+                } catch (e) {
+                    console.error(`[DatabaseManager] v9: vec_chunks_${dim} still missing after provisioning:`, e);
+                    allOk = false;
+                }
+            }
+            if (allOk) {
+                console.log('[DatabaseManager] v9 migration: all per-dimension vec0 tables verified ✓');
+            } else {
+                console.warn('[DatabaseManager] v9 migration: some tables missing — sqlite-vec extension may not be loaded');
+            }
+            this.db.pragma('user_version = 9');
+        }
+
+        // Version 9 → 10: Add UNIQUE constraint on embedding_queue(meeting_id, chunk_id).
+        // This enables INSERT OR IGNORE in EmbeddingPipeline.queueMeeting() to silently
+        // skip duplicate rows when queueMeeting() is called more than once for the same meeting.
+        // SQLite doesn't support ADD CONSTRAINT on existing tables, so we recreate the table
+        // using the standard rename-create-copy-drop pattern.
+        if (version < 10) {
+            console.log('[DatabaseManager] Applying migration v9 → v10: Add UNIQUE constraint to embedding_queue');
+            try {
+                // Wrap all steps in an explicit better-sqlite3 transaction for atomicity.
+                // If any step throws, the entire migration is rolled back cleanly —
+                // preventing the dangerous half-renamed table state that a bare exec() chain would leave.
+                const migrate = this.db.transaction(() => {
+                    // Step 1: Rename the existing table to a temp name
+                    this.db!.exec('ALTER TABLE embedding_queue RENAME TO embedding_queue_old;');
+
+                    // Step 2: Recreate with the UNIQUE(meeting_id, chunk_id) constraint
+                    this.db!.exec(`
+                        CREATE TABLE embedding_queue (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            meeting_id TEXT NOT NULL,
+                            chunk_id INTEGER,
+                            status TEXT DEFAULT 'pending',
+                            retry_count INTEGER DEFAULT 0,
+                            error_message TEXT,
+                            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                            processed_at TEXT,
+                            UNIQUE(meeting_id, chunk_id)
+                        );
+                    `);
+
+                    // Step 3: Copy rows; INSERT OR IGNORE silently drops any pre-existing duplicates
+                    this.db!.exec(`
+                        INSERT OR IGNORE INTO embedding_queue
+                            (id, meeting_id, chunk_id, status, retry_count, error_message, created_at, processed_at)
+                        SELECT id, meeting_id, chunk_id, status, retry_count, error_message, created_at, processed_at
+                        FROM embedding_queue_old;
+                    `);
+
+                    // Step 4: Drop the backup
+                    this.db!.exec('DROP TABLE embedding_queue_old;');
+                });
+                migrate();
+                console.log('[DatabaseManager] v10 migration: embedding_queue UNIQUE constraint added ✓');
+            } catch (e) {
+                console.error('[DatabaseManager] v10 migration failed — table structure unchanged:', e);
+                // user_version still advances. We do NOT retry — a failed rename leaves
+                // embedding_queue_old behind; retrying would cause "table already exists".
+                // In the failure case, INSERT OR IGNORE in queueMeeting() will still work
+                // for natural uniqueness (same meeting queued twice picks up existing rows),
+                // just without DB-enforced deduplication.
+            }
+            this.db.pragma('user_version = 10');
+        }
+
+        // Version 10 → 11: Add modes, mode_reference_files, and mode_note_sections tables
+        if (version < 11) {
+            console.log('[DatabaseManager] Applying migration v10 → v11: Add modes tables');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS modes (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    template_type TEXT NOT NULL DEFAULT 'general',
+                    custom_context TEXT NOT NULL DEFAULT '',
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE TABLE IF NOT EXISTS mode_reference_files (
+                    id TEXT PRIMARY KEY,
+                    mode_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    content TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(mode_id) REFERENCES modes(id) ON DELETE CASCADE
+                );
+
+                CREATE TABLE IF NOT EXISTS mode_note_sections (
+                    id TEXT PRIMARY KEY,
+                    mode_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    compiled_prompt TEXT DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(mode_id) REFERENCES modes(id) ON DELETE CASCADE
+                );
+            `);
+            // Seed a default "General" mode as active
+            const defaultModeId = 'mode_general_default';
+            this.db.prepare(`
+                INSERT OR IGNORE INTO modes (id, name, template_type, custom_context, is_active)
+                VALUES (?, ?, ?, ?, 1)
+            `).run(defaultModeId, 'General', 'general', '');
+            this.db.pragma('user_version = 11');
+        }
+
+        // Version 11 → 12: Seed note sections for the default General mode if missing
+        if (version < 12) {
+            console.log('[DatabaseManager] Applying migration v11 → v12: Seed default General mode note sections');
+            const defaultModeId = 'mode_general_default';
+            const modeExists = this.db.prepare('SELECT id FROM modes WHERE id = ?').get(defaultModeId);
+            const existing = modeExists
+                ? this.db.prepare('SELECT id FROM mode_note_sections WHERE mode_id = ?').get(defaultModeId)
+                : null;
+            if (modeExists && !existing) {
+                const defaultSections = [
+                    { title: 'Summary',      description: 'High-level summary of the conversation.' },
+                    { title: 'Action items', description: 'Tasks and follow-ups identified.' },
+                    { title: 'Key points',   description: 'Important points discussed.' },
+                ];
+                const insertSection = this.db.prepare(
+                    'INSERT OR IGNORE INTO mode_note_sections (id, mode_id, title, description, sort_order) VALUES (?, ?, ?, ?, ?)'
+                );
+                defaultSections.forEach((s, i) => {
+                    insertSection.run(`ns_general_${i}`, defaultModeId, s.title, s.description, i);
+                });
+            }
+            this.db.pragma('user_version = 12');
+        }
+
+        // Version 12 → 13: Backfill note sections for any mode instance that has none
+        if (version < 13) {
+            console.log('[DatabaseManager] Applying migration v12 → v13: Backfill missing mode note sections');
+            const BACKFILL_SECTIONS: Record<string, Array<{ title: string; description: string }>> = {
+                general: [
+                    { title: 'Summary',      description: 'High-level summary of the conversation.' },
+                    { title: 'Action items', description: 'Tasks and follow-ups identified.' },
+                    { title: 'Key points',   description: 'Important points discussed.' },
+                ],
+                'looking-for-work': [
+                    { title: 'Follow-up actions',       description: 'Next interview steps or additional materials I said I would send if applicable.' },
+                    { title: 'Overview',                description: 'Overview of the interview, the company, and general structure.' },
+                    { title: 'Questions and responses', description: 'All questions asked to me during the interview and answers that gave.' },
+                    { title: 'Areas to improve',        description: 'What I could have done better during the interview.' },
+                    { title: 'Role details',            description: 'Anything discussed about the position, salary expectations, etc.' },
+                ],
+                sales: [
+                    { title: 'Action Items',        description: 'All action items that were said I would do after the meeting.' },
+                    { title: 'Outcome',             description: 'Did I close the sale and what was the outcome of the conversation.' },
+                    { title: 'Prospect background', description: 'Background and context on who I was selling to.' },
+                    { title: 'Discovery',           description: 'What the prospect said during discovery.' },
+                    { title: 'Product',             description: "How I pitched the product and the prospect's reaction." },
+                    { title: 'Objections',          description: 'Objections from the prospect if there were any.' },
+                ],
+                recruiting: [
+                    { title: 'Action Items',          description: 'All action items that I have to do after the meeting.' },
+                    { title: 'Experience and skills', description: "Candidate's previous work experience and skills discussed." },
+                    { title: 'Quality of responses',  description: 'If there were questions asked, how well and how accurately the candidate answered each question.' },
+                    { title: 'Interest in company',   description: 'What the candidate said about their interest in the company.' },
+                    { title: 'Role expectations',     description: 'Anything discussed about the position, salary expectations, etc.' },
+                ],
+                'team-meet': [
+                    { title: 'Action Items',           description: 'All action items that were said I would do after the meeting.' },
+                    { title: 'Announcements',          description: 'Any team-wide announcements from the meeting.' },
+                    { title: 'Team updates',           description: "Each team member's progress, accomplishments, and current focus." },
+                    { title: 'Challenges or blockers', description: 'Any issues or obstacles raised that may affect progress.' },
+                    { title: 'Decisions made',         description: 'Key decisions or agreements reached during the meeting.' },
+                ],
+                lecture: [
+                    { title: 'Follow-up work', description: 'Follow-up reading, assignments, or tasks to complete.' },
+                    { title: 'Topic',          description: 'Main subject or theme of the lecture.' },
+                    { title: 'Key concepts',   description: 'Core ideas or frameworks covered.' },
+                    { title: 'Content',        description: 'All content from the lecture with incredibly detailed bullet notes.' },
+                ],
+                'technical-interview': [
+                    { title: 'Problems covered', description: 'Each problem asked, the approach used, and the outcome.' },
+                    { title: 'Concepts tested',  description: 'Key algorithms, data structures, or system design concepts that came up.' },
+                    { title: 'What went well',   description: 'Approaches or explanations that landed well.' },
+                    { title: 'Areas to study',   description: 'Topics or gaps identified that need more preparation.' },
+                    { title: 'Action items',     description: 'Follow-up steps — e.g. send code, study specific topics, await next round.' },
+                ],
+            };
+
+            const allModes = this.db.prepare('SELECT id, template_type FROM modes').all() as Array<{ id: string; template_type: string }>;
+            const insertSection = this.db.prepare(
+                'INSERT OR IGNORE INTO mode_note_sections (id, mode_id, title, description, sort_order) VALUES (?, ?, ?, ?, ?)'
+            );
+            for (const mode of allModes) {
+                const hasSection = this.db.prepare('SELECT id FROM mode_note_sections WHERE mode_id = ? LIMIT 1').get(mode.id);
+                if (!hasSection) {
+                    const sections = BACKFILL_SECTIONS[mode.template_type] ?? [];
+                    sections.forEach((s, i) => {
+                        insertSection.run(`ns_bf_${mode.id}_${i}`, mode.id, s.title, s.description, i);
+                    });
+                    if (sections.length > 0) {
+                        console.log(`[DatabaseManager] Backfilled ${sections.length} sections for mode "${mode.id}" (${mode.template_type})`);
+                    }
+                }
+            }
+            this.db.pragma('user_version = 13');
+        }
+
+        // NOTE: profile_custom_notes and profile_persona (v13→14, v14→15 below) are orphaned —
+        // the Custom Context / AI Persona feature they backed was removed. Kept non-destructively.
+        // Version 13 → 14: Add profile_custom_notes table
+        if (version < 14) {
+            console.log('[DatabaseManager] Applying migration v13 → v14: Add profile_custom_notes table');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS profile_custom_notes (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    content TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT OR IGNORE INTO profile_custom_notes (id, content) VALUES (1, '');
+            `);
+            this.db.pragma('user_version = 14');
+        }
+
+        // Version 14 → 15: Add profile_persona table
+        if (version < 15) {
+            console.log('[DatabaseManager] Applying migration v14 → v15: Add profile_persona table');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS profile_persona (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    content TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT OR IGNORE INTO profile_persona (id, content) VALUES (1, '');
+            `);
+            this.db.pragma('user_version = 15');
+        }
+
+        // Version 15 → 16: Add embedding_space identity column + backfill.
+        // The previous re-index compatibility check keyed on `embedding_provider`
+        // (name only, e.g. 'gemini'), which CANNOT distinguish two models with the
+        // same provider+dimensions but incompatible vector spaces (e.g.
+        // gemini-embedding-001 768d vs gemini-embedding-2 768d). embedding_space is
+        // the composite `${name}:${model}:${dims}` identity that fixes this.
+        //
+        // Backfill synthesizes the v1 space for each legacy row from its existing
+        // provider+dims so it correctly DIFFERS from any new model's space. The
+        // model strings below must match each provider's shipped default at the
+        // time legacy rows were written (see electron/rag/embeddingSpace.ts:legacySpaceForProvider).
+        if (version < 16) {
+            console.log('[DatabaseManager] Applying migration v15 → v16: Add embedding_space column + backfill');
+            try { this.db.exec('ALTER TABLE meetings ADD COLUMN embedding_space TEXT'); } catch (e) { /* column already exists */ }
+            try {
+                // Build the CASE arms from the SAME shared map legacySpaceForProvider uses,
+                // so the migration backfill and the runtime space key can never drift apart.
+                const caseArms = buildLegacySpaceCaseSql();
+                this.db.exec(`
+                    UPDATE meetings
+                    SET embedding_space =
+                        embedding_provider || ':' ||
+                        CASE embedding_provider
+                          ${caseArms}
+                          ELSE 'unknown'
+                        END || ':' ||
+                        COALESCE(CAST(embedding_dimensions AS TEXT), 'unknown')
+                    WHERE embedding_provider IS NOT NULL
+                      AND embedding_space IS NULL;
+                `);
+                this.db.exec('CREATE INDEX IF NOT EXISTS idx_meetings_embedding_space ON meetings(embedding_space);');
+                console.log('[DatabaseManager] v16 migration: embedding_space backfilled + indexed ✓');
+            } catch (e) {
+                console.error('[DatabaseManager] v16 migration backfill failed (non-fatal):', e);
+            }
+            this.db.pragma('user_version = 16');
+        }
+
+        // Version 16 → 17: Track post-meeting note generation state.
+        // V3 summarization is multi-stage (queued → chunking → summarizing_chunks →
+        // reducing → validating → completed/failed). Store only a safe status string —
+        // never transcript or generated note content — so the UI can expose retry/regenerate.
+        if (version < 17) {
+            console.log('[DatabaseManager] Applying migration v16 → v17: Add summary_status column');
+            try { this.db.exec("ALTER TABLE meetings ADD COLUMN summary_status TEXT DEFAULT 'completed'"); } catch (e) { /* column already exists */ }
+            try { this.db.exec("UPDATE meetings SET summary_status = 'queued' WHERE is_processed = 0"); } catch (e) { /* non-fatal backfill */ }
+            this.db.pragma('user_version = 17');
+        }
+
+        // Version 17 → 18: Add compiled_prompt to mode_note_sections. When a user adds or
+        // edits a note-section (or creates a custom mode), an AI-compiled extraction
+        // instruction is generated from the section's title+description and cached here so
+        // summary generation can fill that section faithfully. Empty/null = fall back to
+        // title+description. Never stores transcript or note content.
+        if (version < 18) {
+            console.log('[DatabaseManager] Applying migration v17 → v18: Add compiled_prompt to mode_note_sections');
+            try { this.db.exec("ALTER TABLE mode_note_sections ADD COLUMN compiled_prompt TEXT DEFAULT ''"); } catch (e) { /* column already exists */ }
+            this.db.pragma('user_version = 18');
+        }
+
+        if (version < 19) {
+            // PDF ingestion now captures real page counts (electron/ipcHandlers.ts
+            // 2026-06-27 fix F1+F2). Persist them on the file row so the
+            // retriever can use real numbers instead of falling back to the
+            // 3000-char text-length heuristic on every app restart.
+            console.log('[DatabaseManager] Applying migration v18 → v19: Add page_count + extracted_page_count to mode_reference_files');
+            try { this.db.exec("ALTER TABLE mode_reference_files ADD COLUMN page_count INTEGER"); } catch (e) { /* column already exists */ }
+            try { this.db.exec("ALTER TABLE mode_reference_files ADD COLUMN extracted_page_count INTEGER"); } catch (e) { /* column already exists */ }
+            this.db.pragma('user_version = 19');
+        }
+
+        if (version < 20) {
+            // OKF Hybrid Knowledge System (Phase 2, 2026-07-01): structured,
+            // source-attributed "Knowledge Packs" (OKF-compatible Knowledge
+            // Bundles) generated from uploaded reference files, layered ON TOP
+            // of (never replacing) mode_reference_files / mode_reference_chunks.
+            // All FKs cascade on mode/source deletion so a deleted reference
+            // file's pack/cards/entities/relations are cleaned up automatically.
+            console.log('[DatabaseManager] Applying migration v19 → v20: Add OKF knowledge_* tables');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS knowledge_sources (
+                    id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL DEFAULT 'reference_file',
+                    file_id TEXT,
+                    mode_id TEXT,
+                    file_name TEXT,
+                    source_checksum TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    indexed_at TEXT,
+                    page_count INTEGER,
+                    extracted_page_count INTEGER,
+                    index_version TEXT NOT NULL DEFAULT 'knowledge_pack_v1',
+                    embedding_space TEXT,
+                    FOREIGN KEY(file_id) REFERENCES mode_reference_files(id) ON DELETE CASCADE,
+                    FOREIGN KEY(mode_id) REFERENCES modes(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_knowledge_sources_file_id ON knowledge_sources(file_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_sources_mode_id ON knowledge_sources(mode_id);
+
+                CREATE TABLE IF NOT EXISTS knowledge_packs (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    mode_id TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    index_md TEXT NOT NULL DEFAULT '',
+                    stats_json TEXT NOT NULL DEFAULT '{}',
+                    pack_version INTEGER NOT NULL DEFAULT 1,
+                    generated_by TEXT NOT NULL DEFAULT 'okf_extractor_v1',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(source_id) REFERENCES knowledge_sources(id) ON DELETE CASCADE,
+                    FOREIGN KEY(mode_id) REFERENCES modes(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_knowledge_packs_source_id ON knowledge_packs(source_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_packs_mode_id ON knowledge_packs(mode_id);
+
+                CREATE TABLE IF NOT EXISTS knowledge_cards (
+                    id TEXT PRIMARY KEY,
+                    pack_id TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    concept_id TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    body_markdown TEXT,
+                    source_pages_json TEXT NOT NULL DEFAULT '[]',
+                    source_sections_json TEXT NOT NULL DEFAULT '[]',
+                    source_quotes_json TEXT NOT NULL DEFAULT '[]',
+                    entities_json TEXT NOT NULL DEFAULT '[]',
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    related_card_ids_json TEXT NOT NULL DEFAULT '[]',
+                    confidence TEXT NOT NULL DEFAULT 'medium',
+                    generated_from TEXT NOT NULL DEFAULT 'pdf_extraction',
+                    source_checksum TEXT NOT NULL,
+                    user_edited INTEGER NOT NULL DEFAULT 0,
+                    approval_status TEXT NOT NULL DEFAULT 'generated',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    card_version INTEGER NOT NULL DEFAULT 1,
+                    FOREIGN KEY(pack_id) REFERENCES knowledge_packs(id) ON DELETE CASCADE,
+                    FOREIGN KEY(source_id) REFERENCES knowledge_sources(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_knowledge_cards_pack_id ON knowledge_cards(pack_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_cards_source_id ON knowledge_cards(source_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_cards_concept_id ON knowledge_cards(concept_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_cards_type ON knowledge_cards(type);
+
+                CREATE TABLE IF NOT EXISTS knowledge_entities (
+                    id TEXT PRIMARY KEY,
+                    pack_id TEXT NOT NULL,
+                    slug TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    type TEXT NOT NULL DEFAULT 'concept',
+                    aliases_json TEXT NOT NULL DEFAULT '[]',
+                    description TEXT NOT NULL DEFAULT '',
+                    source_card_ids_json TEXT NOT NULL DEFAULT '[]',
+                    source_pages_json TEXT NOT NULL DEFAULT '[]',
+                    first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(pack_id) REFERENCES knowledge_packs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_knowledge_entities_pack_id ON knowledge_entities(pack_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_entities_slug ON knowledge_entities(slug);
+
+                CREATE TABLE IF NOT EXISTS knowledge_relations (
+                    id TEXT PRIMARY KEY,
+                    pack_id TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    subject_type TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    object_id TEXT NOT NULL,
+                    object_type TEXT NOT NULL,
+                    source_card_ids_json TEXT NOT NULL DEFAULT '[]',
+                    source_pages_json TEXT NOT NULL DEFAULT '[]',
+                    confidence TEXT NOT NULL DEFAULT 'medium',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(pack_id) REFERENCES knowledge_packs(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_knowledge_relations_pack_id ON knowledge_relations(pack_id);
+                CREATE INDEX IF NOT EXISTS idx_knowledge_relations_subject_id ON knowledge_relations(subject_id);
+
+                CREATE TABLE IF NOT EXISTS knowledge_index_versions (
+                    id TEXT PRIMARY KEY,
+                    source_id TEXT NOT NULL,
+                    pack_id TEXT,
+                    pack_version INTEGER NOT NULL DEFAULT 1,
+                    content_hash TEXT NOT NULL,
+                    embedding_space TEXT,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error_message TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(source_id) REFERENCES knowledge_sources(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_knowledge_index_versions_source_id ON knowledge_index_versions(source_id);
+            `);
+            this.db.pragma('user_version = 20');
+        }
+
+        if (version < 21) {
+            // OKF Phase 6 (2026-07-01): user edits and approval workflow.
+            // knowledge_card_versions preserves EVERY prior card body (both
+            // generated and user-edited) so an edit can always be reverted to
+            // the original generated card, never destructively overwriting
+            // history. approval_status/user_edited columns already exist on
+            // knowledge_cards (added in v19→v20); this migration adds the
+            // version-history table those columns' UI depends on.
+            console.log('[DatabaseManager] Applying migration v20 → v21: Add knowledge_card_versions table');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS knowledge_card_versions (
+                    id TEXT PRIMARY KEY,
+                    card_id TEXT NOT NULL,
+                    card_version INTEGER NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    entities_json TEXT NOT NULL DEFAULT '[]',
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    confidence TEXT NOT NULL DEFAULT 'medium',
+                    edited_by TEXT NOT NULL DEFAULT 'system',
+                    edit_reason TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(card_id) REFERENCES knowledge_cards(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_knowledge_card_versions_card_id ON knowledge_card_versions(card_id);
+            `);
+            this.db.pragma('user_version = 21');
+        }
+
+        if (version < 22) {
+            // FIX 2026-07-01: backfill page_count / extracted_page_count on
+            // existing reference_file rows where the column is NULL. The cause:
+            // the v18→v19 schema migration added the columns and the v19→v21
+            // rounds shipped the upstream producer-side forwarding fix (see
+            // ModesManager.addReferenceFile). Rows inserted BEFORE that fix
+            // shipped still have NULL page_count, which forces
+            // ModeContextRetriever.reportReferenceFilePageCounts into its
+            // heuristic branch (`referenceFileIngestedByPageHeuristic: true`)
+            // until the user re-uploads the file. This migration derives the
+            // value from [Page N] markers already embedded in content (round-2
+            // injected those into pdf-parse output). Two phases:
+            //   1) Derive a count from [Page N] markers for PDFs (fast, exact).
+            //   2) Fall back to a character-length estimate for any non-PDF
+            //      where markers don't match. Conservative divisor of 3000
+            //      mirrors the live in-app heuristic exactly so downstream
+            //      behavior is stable.
+            // Safe on WAL — single bulk UPDATE per phase, no FK cascade
+            // impact (page_count is a leaf integer column, no schema change).
+            // Idempotent: WHERE page_count IS NULL ensures re-runs are no-ops.
+            console.log('[DatabaseManager] Applying migration v21 → v22: Backfill NULL page_count + extracted_page_count on mode_reference_files');
+            try {
+                // Phase 1: derive exact count from every [Page N] marker via
+                // recursive CTE. The CTE seeds with the first occurrence offset,
+                // then iterates `instr(content, '[Page ', prev + 1)` to find
+                // each subsequent occurrence until instr returns 0 (no more
+                // matches). Each iteration extracts `CAST(... AS INTEGER)` of
+                // the trailing number. MAX() then returns the largest page
+                // number found, which == total page count for any document
+                // with sequentially-numbered markers.
+                //
+                // CRITICAL: the first draft of Phase 1 used a single
+                // `instr(content, '[Page ')` call which returns ONLY the FIRST
+                // occurrence offset — so substr() extracted the page number
+                // from the first marker only (returned 1 for a 66-page PDF).
+                // The recursive CTE walks EVERY occurrence so MAX() finds the
+                // actual total. Test-engineer caught this on 2026-07-01.
+                const phaseOne = this.db.prepare(`
+                    UPDATE mode_reference_files
+                    SET page_count = (
+                        -- Each row's content is its own subquery scope. CTE walks
+                        -- by chopping "rest" to everything-after the [Page N]
+                        -- header, finding the next [Page marker in that rest,
+                        -- extracting its integer, and recursing. The seeded
+                        -- row finds marker #1, the recursive step finds #N+1,
+                        -- and so on until no more markers remain.
+                        -- SQLite's built-in instr() takes (haystack, needle)
+                        -- only — no 3-arg form — so we walk by carving the
+                        -- string instead of using absolute offsets.
+                        -- If no markers exist this SELECT returns NULL (no
+                        -- rows); the WHERE phase_count IS NULL guard in Phase 2
+                        -- picks those rows back up for the heuristic fallback.
+                        WITH RECURSIVE cte_pages(rest, page_num) AS (
+                            SELECT
+                                substr(content, instr(content, '[Page ') + 6),
+                                CASE
+                                    WHEN instr(content, '[Page ') > 0
+                                    THEN CAST(
+                                        substr(
+                                            content,
+                                            instr(content, '[Page ') + 6,
+                                            instr(substr(content, instr(content, '[Page ') + 6), ']') - 1
+                                        ) AS INTEGER
+                                    )
+                                    ELSE NULL
+                                END
+                            -- F-701: there is deliberately NO inner FROM here.
+                            -- An inner FROM mode_reference_files re-opens the
+                            -- table and SHADOWS the outer UPDATE row, which made
+                            -- the old self-equality correlation predicate a
+                            -- tautology over that inner instance — so the
+                            -- subquery was UNCORRELATED and MAX(page_num)
+                            -- returned the largest page number in the WHOLE
+                            -- table, written into every row (a 3-page document
+                            -- reporting 6 pages). A seed with no FROM is a
+                            -- single-row SELECT whose content column binds to the
+                            -- row being updated, which is the correlation this
+                            -- migration always intended.
+                        UNION ALL
+                            SELECT
+                                substr(rest, instr(rest, '[Page ') + 6),
+                                CASE
+                                    WHEN instr(rest, '[Page ') > 0
+                                    THEN CAST(
+                                        substr(
+                                            rest,
+                                            instr(rest, '[Page ') + 6,
+                                            instr(substr(rest, instr(rest, '[Page ') + 6), ']') - 1
+                                        ) AS INTEGER
+                                    )
+                                    ELSE NULL
+                                END
+                            FROM cte_pages
+                            WHERE instr(rest, '[Page ') > 0
+                            LIMIT 5000
+                        )
+                        SELECT MAX(page_num) FROM cte_pages WHERE page_num IS NOT NULL
+                    )
+                    WHERE page_count IS NULL
+                      AND content LIKE '%[Page %]%'
+                `).run();
+                // Phase 2: heuristic for non-marked content (rare — only old
+                // pre-round-2 content or non-PDF text). Use 3000 chars/page to
+                // match the live ModeContextRetriever heuristic exactly.
+                const phaseTwo = this.db.prepare(`
+                    UPDATE mode_reference_files
+                    SET page_count = MAX(1, CAST(LENGTH(content) / 3000 AS INTEGER)),
+                        extracted_page_count = MAX(1, CAST(LENGTH(content) / 3000 AS INTEGER))
+                    WHERE page_count IS NULL
+                `).run();
+                console.log(`[DatabaseManager] v22 backfill: derived ${phaseOne.changes} rows from [Page N] markers, heuristically estimated ${phaseTwo.changes} remaining rows`);
+                // Senior-review fix 2026-07-01: only advance the schema version
+                // when BOTH phases complete without throwing. The catch block
+                // below now re-throws so we don't get stuck re-running a
+                // partial migration on every app start (which would retry
+                // any deterministic SQLite failure — e.g. recursion limit on
+                // a 5000+ marker pathological doc — forever).
+                this.db.pragma('user_version = 22');
+            } catch (e) {
+                console.error('[DatabaseManager] v22 backfill migration failed (re-throwing to halt startup so user sees the error):', e);
+                throw e;
+            }
+        }
+
+        if (version < 23) {
+            // OKF Profile Intelligence upgrade (2026-07-02): the shared knowledge_*
+            // tables (v19→v20) were built for MODE reference files — knowledge_sources
+            // and knowledge_packs declare `mode_id TEXT NOT NULL` with an FK to
+            // modes(id). Profile packs (candidate resume/JD → OKF cards) have no user
+            // mode. Rather than fork a parallel table family (explicitly forbidden by
+            // the migration brief — "no second OKF stack"), we reserve ONE sentinel
+            // mode row, '__profile_okf__', that profile packs hang off. It satisfies
+            // the NOT NULL + FK constraint AND is filterable so it never surfaces as a
+            // real mode: ModesManager.getModes and every getPacksByModeId caller for
+            // document-grounded retrieval query by a USER mode id, never this reserved
+            // id, so profile cards can never leak into a document-grounded answer via
+            // the mode path. The premium KnowledgeDatabaseManager enables
+            // `PRAGMA foreign_keys = ON` on this same shared connection at boot, so the
+            // FK is genuinely enforced at runtime — the sentinel is required, not
+            // cosmetic. template_type '__reserved__' keeps it out of the general/custom
+            // template universe.
+            //
+            // Also add the `pii` marker column to knowledge_cards: profile cards carry
+            // pii=1 so downstream tooling (export, UI, any future consumer) can filter
+            // PII cards. Reference-file cards keep the default pii=0 — no behavior
+            // change for the existing document OKF path.
+            console.log('[DatabaseManager] Applying migration v22 → v23: profile OKF (knowledge_cards.pii)');
+            const addPiiColumn = () => {
+                try {
+                    this.db!.exec(`ALTER TABLE knowledge_cards ADD COLUMN pii INTEGER NOT NULL DEFAULT 0`);
+                } catch (e) {
+                    // Column already exists (idempotent re-run / older partial migration) — additive ALTER only.
+                    const msg = (e as Error)?.message || '';
+                    if (!/duplicate column name/i.test(msg)) throw e;
+                }
+            };
+            addPiiColumn();
+            this.db.pragma('user_version = 23');
+        }
+
+        // The '__profile_okf__' sentinel row itself is ensured on EVERY boot,
+        // not inside the v23 gate where it used to live — see
+        // ensureProfileOkfSentinelMode for the live defect that forced this.
+        this.ensureProfileOkfSentinelMode();
+
+        // Version 23 → 24: Context OS memory safety (docs/context-os/, Phase 9).
+        // assistant_claims separates factual CLAIMS from conversational assistant
+        // messages: a claim starts `unverified` and only `verified` claims (with
+        // evidence pointers) may ever be re-used as evidence in a later turn.
+        // turn_context_contracts persists the privacy-safe per-turn source
+        // decision so contamination incidents can be reproduced from the trace.
+        // Both tables are ADDITIVE — no existing table or write path changes.
+        if (version < 24) {
+            console.log('[DatabaseManager] Applying migration v23 → v24: Context OS assistant_claims + turn_context_contracts');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS assistant_claims (
+                    claim_id TEXT PRIMARY KEY,
+                    turn_id TEXT NOT NULL,
+                    claim_text TEXT NOT NULL,
+                    source_owner TEXT NOT NULL,
+                    requested_property TEXT,
+                    validation_status TEXT NOT NULL DEFAULT 'unverified',
+                    evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    contradicted_by_claim_id TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_assistant_claims_turn ON assistant_claims(turn_id);
+                CREATE INDEX IF NOT EXISTS idx_assistant_claims_status ON assistant_claims(validation_status);
+
+                CREATE TABLE IF NOT EXISTS turn_context_contracts (
+                    turn_id TEXT PRIMARY KEY,
+                    surface TEXT NOT NULL,
+                    active_mode_id TEXT,
+                    answer_shape TEXT NOT NULL,
+                    source_owner TEXT NOT NULL,
+                    requested_property TEXT,
+                    allowed_sources_json TEXT NOT NULL DEFAULT '[]',
+                    forbidden_sources_json TEXT NOT NULL DEFAULT '[]',
+                    memory_write_policy_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_turn_contracts_surface ON turn_context_contracts(surface);
+            `);
+            this.db.pragma('user_version = 24');
+        }
+
+        // Version 24 → 25: persisted ModeSourceContract (real-custom-mode-repair,
+        // 2026-07-11). Closes the root cause of the P0 contamination incident:
+        // `documentGrounded`/`sourceAuthority` were previously RE-DERIVED on every
+        // turn by regex-matching the mode's free-text prompt, so a real user's
+        // natural phrasing silently failed to satisfy the detector and modes
+        // defaulted to `general_mixed` (everything allowed) with no user
+        // visibility. `source_contract_json` stores the explicit, typed,
+        // user-editable ModeSourceContract (electron/services/modeSourceContract.ts).
+        // NULL means "not yet migrated" — ModesManager migrates it once on first
+        // read and persists the result (never re-derives per-turn again).
+        if (version < 25) {
+            console.log('[DatabaseManager] Applying migration v24 → v25: Add modes.source_contract_json');
+            const hasColumn = this.db.prepare(`PRAGMA table_info(modes)`).all()
+                .some((col: any) => col.name === 'source_contract_json');
+            if (!hasColumn) {
+                this.db.exec(`ALTER TABLE modes ADD COLUMN source_contract_json TEXT`);
+            }
+            this.db.pragma('user_version = 25');
+        }
+
+        // Version 25 → 26: modes.is_builtin (2026-08-09).
+        //
+        // Until now there were no default modes. Every row was a user-created
+        // `mode_<uuid>` with a freely editable template, including the ones
+        // NAMED "General" / "Team Meet" / "Technical Interview", and updateMode
+        // would persist any template onto any row. A mode named "Technical
+        // Interview" therefore ran as `general` — the one built-in with
+        // `profileSources: []` — and the user's résumé was silently out of
+        // scope.
+        //
+        // This migration only ADDS the column. Deciding which existing rows
+        // become built-ins reclassifies user data, so that rule lives in
+        // services/builtinModes.ts (pure, tested) and is applied once at
+        // startup by ModesManager.ensureBuiltinModes() — where seeding can reuse
+        // createMode and get note sections and a source contract for free.
+        if (version < 26) {
+            console.log('[DatabaseManager] Applying migration v25 → v26: Add modes.is_builtin');
+            const hasColumn = this.db.prepare(`PRAGMA table_info(modes)`).all()
+                .some((col: any) => col.name === 'is_builtin');
+            if (!hasColumn) {
+                this.db.exec(`ALTER TABLE modes ADD COLUMN is_builtin INTEGER NOT NULL DEFAULT 0`);
+            }
+            this.db.pragma('user_version = 26');
+        }
+
+        // Version 26 → 27: usage_outbox — durable queue for client-reported
+        // usage events (2026-08-14, Usage Ledger campaign 2).
+        //
+        // WHY A DURABLE QUEUE AND NOT fetch-and-forget.
+        //
+        // The events this carries are the ONLY evidence that a BYOK feature ran.
+        // When a customer uses their own provider key, the backend executes
+        // nothing and meters nothing, so an event dropped because the laptop was
+        // on a plane is not a gap in telemetry — it is the entire record of that
+        // session, gone. A fetch() that fails during a network blip loses it
+        // silently and forever.
+        //
+        // WHY IT LIVES HERE rather than in a JSON file or electron-store: this
+        // is where the app already keeps durable local state, it is already
+        // migrated, already WAL-checkpointed on shutdown, and already survives
+        // crash/sleep/restart. A second persistence engine would have to earn
+        // all of that again.
+        //
+        // NOTE ON `status`: 'delivered' rows are kept briefly rather than
+        // deleted on ACK, so a duplicate enqueue of the same event_id inside the
+        // compaction window is caught by the UNIQUE constraint instead of being
+        // re-sent. compactOutbox() removes them after 7 days.
+        if (version < 27) {
+            console.log('[DatabaseManager] Applying migration v26 → v27: usage_outbox');
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS usage_outbox (
+                    event_id        TEXT PRIMARY KEY,
+                    layer           TEXT NOT NULL DEFAULT 'ledger',
+                    payload_json    TEXT NOT NULL,
+                    status          TEXT NOT NULL DEFAULT 'pending',
+                    attempt_count   INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at   INTEGER NOT NULL DEFAULT 0,
+                    last_error      TEXT,
+                    created_at      INTEGER NOT NULL,
+                    delivered_at    INTEGER
+                );
+                CREATE INDEX IF NOT EXISTS usage_outbox_due_idx
+                    ON usage_outbox (status, next_retry_at);
+                CREATE INDEX IF NOT EXISTS usage_outbox_created_idx
+                    ON usage_outbox (created_at);
+            `);
+            this.db.pragma('user_version = 27');
+        }
+
+        // user_titled flag on meetings (RC-7, 2026-08-21). A user rename was
+        // silently overwritten TWICE: by the post-call title generation in
+        // saveMeeting's final write, and unconditionally by
+        // replaceDetailedSummary when the deferred V3 summary landed. The flag
+        // is set by updateMeetingTitle (the one rename entry point) and makes
+        // every generated-title write yield to it.
+        //
+        // APPLIED UNCONDITIONALLY, NOT VERSION-GATED (live incident,
+        // 2026-08-23): this shipped as `if (version < 28)` while a parallel
+        // branch's migrations stamped the same numbers first — the live DB was
+        // observed at user_version 30 WITHOUT the column, so the gate never
+        // ran and EVERY saveMeeting threw "table meetings has no column named
+        // user_titled": meetings (including their generated summaries) were
+        // silently lost. An additive nullable column is idempotent by
+        // construction (the try/catch absorbs "duplicate column"), so it must
+        // not depend on a version counter that concurrent branches can race.
+        try { this.db.exec("ALTER TABLE meetings ADD COLUMN user_titled INTEGER DEFAULT 0"); } catch (e) { /* Column already exists */ }
+        // The linked calendar event's snapshot (Meeting.calendarEvent), 2026-09-27.
+        // Additive and nullable, so applied the same unconditional way.
+        try { this.db.exec("ALTER TABLE meetings ADD COLUMN calendar_event_json TEXT"); } catch (e) { /* Column already exists */ }
+        // Which of the other side's voices said a line (speaker_2…, named in the
+        // meeting's speakerLabels): the call's speaking record (2026-09-27) puts
+        // names on group calls, whose voices share one channel. `speaker` keeps
+        // the channel, so everything that reads it is unchanged. Additive and
+        // nullable, applied the same unconditional way.
+        try { this.db.exec("ALTER TABLE transcripts ADD COLUMN speaker_id TEXT"); } catch (e) { /* Column already exists */ }
+        // Where each line came from (2026-10-04): speech, typed chat, or the
+        // assistant. The session knew this while the meeting ran, but the saved
+        // rows did not, so everything that re-reads a saved meeting (search
+        // indexing, regenerate notes, reindex) treated typed questions and the
+        // assistant's answers as things said in the meeting. NULL on older rows;
+        // readers fall back to the speaker (see savedTranscriptOrigin.ts).
+        // Additive and nullable, applied the same unconditional way.
+        try { this.db.exec("ALTER TABLE transcripts ADD COLUMN origin TEXT"); } catch (e) { /* Column already exists */ }
+        if (version < 28) {
+            this.db.pragma('user_version = 28');
+        }
+
+        // MERGE NOTE (2026-08-23): SECOND renumbering. main advanced and claimed
+        // 28 for meetings.user_titled — a real ALTER TABLE — while this branch's
+        // page-count repair also sat on 28. Whichever stamped first would have
+        // permanently suppressed the other. main is the shared trunk, so it keeps
+        // 28 and this branch moved to 29 (page-count repair) and 30 (vec0 cosine
+        // rebuild). Neither number was ever released, so no installed profile can
+        // be sitting on the old numbering.
+        // MERGE NOTE (2026-08-19): main's v26 → v27 (usage_outbox) and this
+        // branch's page-count repair BOTH claimed version 27. Whichever ran
+        // first would have stamped user_version = 27 and permanently suppressed
+        // the other — a user coming from main would never get the page-count
+        // repair, and a user from this branch would never get usage_outbox.
+        // main is the shared trunk, so it keeps 27 and this branch's two
+        // migrations were renumbered to 28 (page-count repair) and 29 (vec0
+        // cosine rebuild). This branch was never released, so no installed
+        // profile can be sitting on its old 27/28 numbering.
+        // Version 27 → 28: REPAIR the page counts corrupted by v22 (F-701/F-702).
+        //
+        // v22's Phase 1 seeded its recursive CTE from an inner
+        // `FROM mode_reference_files`, which shadowed the outer UPDATE row and
+        // made its correlation predicate a tautology. The subquery was
+        // therefore uncorrelated and wrote the LARGEST page number in the whole
+        // table into EVERY marker-bearing row — a 3-page document reporting 6
+        // pages. It could not self-heal, because `page_count IS NULL` was false
+        // on any re-run. v22 also never set extracted_page_count on those rows
+        // (Phase 2 was gated on the same predicate Phase 1 had just falsified),
+        // so the extraction-coverage signal was silently absent.
+        //
+        // This repair re-derives both values from the [Page N] markers, which
+        // are ground truth for marker-bearing content. It is unconditional over
+        // marker-bearing rows (not gated on IS NULL) precisely because the bad
+        // values are non-NULL, and it is idempotent — re-running derives the
+        // same counts.
+        // CR-06: this repair is gated on `user_version`, the SCHEMA counter, but it
+        // changes no schema — it is pure UPDATE over mode_reference_files, and it is
+        // idempotent. Conflating the two is the actual modelling error: when the
+        // repair failed, the (correct-in-isolation) `return` below also blocked v29's
+        // vec0 cosine rebuild FOREVER on that profile, while ensureVecTableForDim
+        // keeps creating every NEW dimension table as cosine — leaving one database
+        // with mixed metrics read through a single `similarity = 1 - distance` and
+        // one shared minSimilarity. That is the exact hazard v29 exists to remove,
+        // reached through a different door.
+        //
+        // So the two are separated: the schema version advances (safe — no schema
+        // change here), and the repair records its own pending flag in app_state and
+        // retries on later launches until it succeeds. R-05's requirement is
+        // preserved (a failed repair is never forgotten); what changes is that a
+        // failed DATA repair no longer holds the SCHEMA chain hostage.
+        const pageRepairPending = (() => {
+            if (version < 29) return true;
+            try {
+                const row = this.db.prepare('SELECT value FROM app_state WHERE key = ?')
+                    .get(PAGE_COUNT_REPAIR_PENDING_KEY) as { value?: string } | undefined;
+                return row?.value === '1';
+            } catch (e) {
+                // The ONE place this design could lose a retry: if the marker cannot
+                // be read we cannot tell "no repair owed" from "repair owed but
+                // unreadable", and R-05's requirement is that a failed repair is
+                // never forgotten. The repair is a pure idempotent UPDATE, so
+                // re-running it when none was owed costs one no-op statement —
+                // strictly cheaper than dropping one that WAS owed.
+                console.warn('[DatabaseManager] could not read the page-count repair marker; '
+                    + 're-running the repair rather than risk forgetting a pending one:', e);
+                return true;
+            }
+        })();
+
+        if (pageRepairPending) {
+            console.log('[DatabaseManager] Applying migration v28 → v29: Repair v22 page_count/extracted_page_count corruption');
+            try {
+                const repaired = this.db.prepare(`
+                    UPDATE mode_reference_files
+                    SET page_count = (
+                        WITH RECURSIVE cte_pages(rest, page_num) AS (
+                            SELECT
+                                substr(content, instr(content, '[Page ') + 6),
+                                CASE
+                                    WHEN instr(content, '[Page ') > 0
+                                    THEN CAST(
+                                        substr(
+                                            content,
+                                            instr(content, '[Page ') + 6,
+                                            instr(substr(content, instr(content, '[Page ') + 6), ']') - 1
+                                        ) AS INTEGER
+                                    )
+                                    ELSE NULL
+                                END
+                        UNION ALL
+                            SELECT
+                                substr(rest, instr(rest, '[Page ') + 6),
+                                CASE
+                                    WHEN instr(rest, '[Page ') > 0
+                                    THEN CAST(
+                                        substr(
+                                            rest,
+                                            instr(rest, '[Page ') + 6,
+                                            instr(substr(rest, instr(rest, '[Page ') + 6), ']') - 1
+                                        ) AS INTEGER
+                                    )
+                                    ELSE NULL
+                                END
+                            FROM cte_pages
+                            WHERE instr(rest, '[Page ') > 0
+                            LIMIT 5000
+                        )
+                        SELECT MAX(page_num) FROM cte_pages WHERE page_num IS NOT NULL
+                    )
+                    -- R-11: scope the re-derive to rows v22 could actually have
+                    -- corrupted. v22 Phase 1 ran WHERE page_count IS NULL AND
+                    -- content LIKE '%[Page %]%' and set ONLY page_count — it never
+                    -- wrote extracted_page_count. The ingestion path writes the two
+                    -- TOGETHER (pageCount from data.total, extractedPageCount from
+                    -- data.pages). So extracted_page_count IS NULL is the signature
+                    -- of a row v22 touched, and its presence is the signature of a
+                    -- row that came from ingestion and must be left alone.
+                    --
+                    -- Without this scope the re-derive was unconditional and
+                    -- DOWNGRADED correct values: on the extractor's timeout path
+                    -- (SafeDocumentTextExtractor withTimeout -> parser.destroy())
+                    -- data.pages is partial while data.total is the true count, so a
+                    -- document with a correct page_count of 10 and an honest 3/10
+                    -- coverage signal was rewritten to 3/3 — destroying the value AND
+                    -- erasing the coverage gap it encoded, which ModeContextRetriever
+                    -- consumes as ingested-page coverage.
+                    WHERE content LIKE '%[Page %]%'
+                      AND extracted_page_count IS NULL
+                `).run();
+                // Mirror the ingestion path (ipcHandlers writes pageCount and
+                // extractedPageCount together) for rows still missing the
+                // extraction figure.
+                //
+                // R-11: scoped to MARKER-BEARING rows. Unscoped, this reached rows
+                // v22 never touched and fabricated 100% extraction coverage for
+                // documents from which zero page-level text was extracted — a PDF
+                // whose data.pages came back empty has page_count from data.total but
+                // extractedPageCount undefined -> NULL, and this wrote page_count
+                // into it. A marker-less row now keeps NULL, an honest "unknown",
+                // rather than claiming full coverage. (A scanned PDF with
+                // extracted_page_count = 0 was already safe: `?? null` preserves 0
+                // and the IS NULL guard skips it.)
+                const filled = this.db.prepare(`
+                    UPDATE mode_reference_files
+                    SET extracted_page_count = page_count
+                    WHERE extracted_page_count IS NULL
+                      AND page_count IS NOT NULL
+                      AND content LIKE '%[Page %]%'
+                `).run();
+                console.log(`[DatabaseManager] v29 repair: re-derived ${repaired.changes} marker-bearing rows, filled ${filled.changes} extracted_page_count values`);
+                // Succeeded — clear any pending marker from an earlier failed launch.
+                try {
+                    this.db.prepare('DELETE FROM app_state WHERE key = ?').run(PAGE_COUNT_REPAIR_PENDING_KEY);
+                } catch { /* the repair itself is what matters */ }
+            } catch (e) {
+                // R-05 found the original hazard here: this block swallows rather
+                // than re-throwing so the repair retries next launch, but `version`
+                // is read ONCE into a const, so control fell straight through to the
+                // NEXT migration with the stale snapshot — which then succeeded and
+                // stamped a version past this one, so the repair never ran again.
+                // Re-reading the pragma does not help; the stale const is the point.
+                //
+                // CR-06 removes the conflict instead of stalling the chain: this
+                // repair changes no schema, so the version may advance while the
+                // repair itself is recorded as still-owed in its own marker and
+                // retried on every later launch. R-05's requirement — a failed
+                // repair is never forgotten — is preserved by the marker, not by
+                // freezing user_version.
+                try {
+                    this.db.prepare('INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)')
+                        .run(PAGE_COUNT_REPAIR_PENDING_KEY, '1');
+                    console.error('[DatabaseManager] page-count repair failed; marked pending and will retry on the next launch. '
+                        + 'Later migrations still run — this repair changes no schema:', e);
+                } catch (markErr) {
+                    // Could not even record the marker, so the retry would be lost.
+                    // THEN the original behaviour is right: stop, leave the version
+                    // put, and let the whole block run again next launch.
+                    console.error('[DatabaseManager] v28 page-count repair failed AND its pending marker could not be written; '
+                        + 'leaving version at 27 and skipping later migrations so the repair is not forgotten:', e, markErr);
+                    return;
+                }
+            }
+            if (version < 29) this.db.pragma('user_version = 29');
+        }
+
+        // Version 28 → 29: rebuild the vec0 tables with distance_metric=cosine (F-410).
+        //
+        // The tables were created without a distance metric, and sqlite-vec
+        // defaults to L2. VectorStore then read that column as if it were a
+        // cosine distance (`similarity = 1 - vecRow.distance`) and every
+        // consumer thresholded the result as a cosine in [-1,1]: minSimilarity
+        // 0.25, MEETING_MIN_SIMILARITY 0.3, MEETING_RAG_MIN_SIMILARITY. For
+        // unit vectors L2 = sqrt(2-2cos), so a 0.25 floor silently demanded
+        // cos >= 0.719; for NON-unit vectors it is worse still — a vector with
+        // identical direction but twice the magnitude scores 0.0 and is
+        // dropped outright (measured). The JS fallback computes true cosine and
+        // applies the SAME floor, so the two paths disagreed sharply on
+        // identical data — and every existing test forces the JS path, which is
+        // why the shipped native path was never covered.
+        //
+        // Ranking order is unaffected for normalized vectors (L2 is monotonic
+        // in cosine), which is why this degraded recall silently rather than
+        // producing visibly wrong output.
+        //
+        // vec0 virtual tables cannot be ALTERed, so the metric change requires
+        // a drop + recreate + backfill from the embedding BLOBs still held in
+        // chunks / chunk_summaries.
+        if (version < 30) {
+            console.log('[DatabaseManager] Applying migration v29 → v30: rebuild vec0 tables with cosine distance');
+            try {
+                // The rebuild is no longer done HERE in one unbounded pass
+                // (2026-10-05): it copied every stored vector before the first
+                // window, so its cost grew with the index — 141 MB of vectors
+                // for a 12,000-chunk profile. repairVecTables() does the same
+                // drop + recreate + backfill, driven by each table's own DDL:
+                //   - R-08 holds: it lists the vec0 tables that actually exist
+                //     (any dimension, 384 included), not KNOWN_DIMS.
+                //   - R-13 holds for what it rebuilds at once (small tables,
+                //     one transaction). A large table is instead recorded in
+                //     app_state and rebuilt after launch in slices; until that
+                //     finishes VectorStore searches it through the JS cosine
+                //     path, so the empty-but-present table R-13 describes can
+                //     never be the one a query reads.
+                //   - R-22 holds twice over: it throws (no stamp, chain stops)
+                //     if a wrong-metric table could be neither rebuilt nor
+                //     recorded as pending, and because it reads the DDL it
+                //     runs again on every launch until nothing is left —
+                //     independent of user_version, like the page-count repair
+                //     above.
+                this.repairVecTables({ fromMigration: true });
+                this.db.pragma('user_version = 30');
+            } catch (e) {
+                console.error('[DatabaseManager] v30 vec0 cosine rebuild failed (leaving version at 29 to retry next launch):', e);
+                // R-22: stop here, as v28/v29 do. v30 is currently the LAST
+                // migration, so falling through is harmless TODAY — which is
+                // precisely why it would not stay harmless: the next migration
+                // added below would run and stamp user_version past a v30 that
+                // never applied, and `version < 30` would be false forever after.
+                // That is R-05 verbatim, and R-05 only became reachable because
+                // an earlier block was written this same way.
+                return;
+            }
+        }
+
+        if (version < 31) {
+            console.log('[DatabaseManager] Applying migration v30 → v31: screenshot description cache');
+            try {
+                // A screenshot's text transcription, keyed by the EXACT bytes of
+                // the image. Describing a screen costs a vision call with a
+                // multi-second budget, and the same screen is re-attached
+                // constantly (re-captures of one window, one slide, one error
+                // dialog), so this is a cache before it is storage.
+                //
+                // The key is a sha256 of the file, deliberately NOT
+                // ImageHashService.computeHash — that is a 16x16 grayscale
+                // average hash built for CHANGE DETECTION, and it collides
+                // across screens that merely look alike at that resolution.
+                // Serving one screen's transcription for another is a
+                // confidently wrong answer about an error code the user can see
+                // with their own eyes, which is worse than no cache at all.
+                this.db.exec(`
+                    CREATE TABLE IF NOT EXISTS screenshot_descriptions (
+                        image_sha256 TEXT PRIMARY KEY,
+                        description  TEXT NOT NULL,
+                        provider     TEXT NOT NULL DEFAULT '',
+                        model        TEXT NOT NULL DEFAULT '',
+                        created_at   INTEGER NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_screenshot_descriptions_created
+                        ON screenshot_descriptions(created_at);
+                `);
+                this.db.pragma('user_version = 31');
+            } catch (e) {
+                console.error('[DatabaseManager] v31 screenshot description cache failed (leaving version at 30 to retry next launch):', e);
+                // Same rule as v28/v29/v30 above: stop rather than fall through,
+                // so a later migration cannot stamp user_version past a v31 that
+                // never applied and make `version < 31` false forever.
+                return;
+            }
+        }
+
+        if (version < 32) {
+            console.log('[DatabaseManager] Applying migration v31 → v32: the user\'s own answers');
+            try {
+                // "Cue Cards" in Profile Intelligence (services/knowledge/ownAnswers.ts):
+                // what the user says about themselves that no résumé states. One row
+                // per question. `status` is 'draft' while the text is Natively's own
+                // proposal and 'saved' once the user wrote or approved it; only
+                // 'saved' rows are ever read by an answer.
+                this.db.exec(`
+                    CREATE TABLE IF NOT EXISTS profile_own_answers (
+                        key        TEXT PRIMARY KEY,
+                        answer     TEXT NOT NULL DEFAULT '',
+                        status     TEXT NOT NULL DEFAULT 'saved' CHECK (status IN ('draft', 'saved')),
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    );
+                `);
+                this.db.pragma('user_version = 32');
+            } catch (e) {
+                console.error('[DatabaseManager] v32 own answers failed (leaving version at 31 to retry next launch):', e);
+                // Same rule as v28 to v31 above: stop rather than fall through.
+                return;
+            }
+        }
+
+        if (version < 33) {
+            console.log('[DatabaseManager] Applying migration v32 → v33: where each own answer came from');
+            try {
+                // `origin` is 'user' when the user typed or changed the words, and
+                // 'drafted' when they accepted Natively's draft as it stood. An
+                // accepted draft is still Natively's guess about them: the
+                // 2026-10-15 benchmark had accepted drafts override the user's own
+                // notes on why they are leaving and on their weakness. Rows from
+                // before this column are treated as the user's own words.
+                const cols = this.db.prepare("PRAGMA table_info('profile_own_answers')").all() as Array<{ name: string }>;
+                if (!cols.some((c) => c.name === 'origin')) {
+                    this.db.exec(`ALTER TABLE profile_own_answers ADD COLUMN origin TEXT NOT NULL DEFAULT 'user' CHECK (origin IN ('user', 'drafted'));`);
+                    // A row still waiting as a draft was written by Natively, whatever the default says.
+                    this.db.exec(`UPDATE profile_own_answers SET origin = 'drafted' WHERE status = 'draft';`);
+                }
+                this.db.pragma('user_version = 33');
+            } catch (e) {
+                console.error('[DatabaseManager] v33 own-answer origin failed (leaving version at 32 to retry next launch):', e);
+                return;
+            }
+        }
+
+        console.log('[DatabaseManager] Migrations completed.');
+    }
+
+    // ============================================
+    // Usage outbox (v27) — durable queue for client-reported usage events
+    // ============================================
+    //
+    // Every method here is guarded and returns a neutral value when the database
+    // is unavailable. This queue must never be able to break the feature it is
+    // observing: a customer whose disk is full still gets to run a meeting.
+
+    /**
+     * Queue one event for delivery.
+     *
+     * INSERT OR IGNORE, not INSERT: enqueuing the same event_id twice is a
+     * no-op, so a retry loop in a caller cannot produce two rows for one logical
+     * event. That is the local half of the replay protection the server enforces
+     * with UNIQUE(event_id).
+     *
+     * Returns 'queued' | 'duplicate' | 'dropped' | 'unavailable'.
+     */
+    public enqueueUsageEvent(eventId: string, layer: 'ledger' | 'telemetry', payload: unknown, opts?: { maxRows?: number }): string {
+        if (!this.db) return 'unavailable';
+        try {
+            // Hard cap. An app that has been offline for a month, or whose
+            // licence has lapsed so every delivery 401s, must not grow this
+            // table without bound. Dropping the OLDEST undelivered event is the
+            // least-bad choice: recent activity is what a dispute is usually
+            // about, and the drop is counted so the loss is visible rather than
+            // silent.
+            const maxRows = opts?.maxRows ?? 10_000;
+            const total = (this.db.prepare(`SELECT COUNT(*) AS n FROM usage_outbox`).get() as any)?.n ?? 0;
+            if (total >= maxRows) {
+                // Make room for exactly one new row.
+                //
+                // ORDER MATTERS. `total` counts EVERY row, but delivered rows are
+                // deliberately retained for a 7-day support window and compaction
+                // only runs on a 6-hour timer — so in a normal desktop session the
+                // table fills with delivered rows. Evicting only `status != 'delivered'`
+                // (the previous behaviour) meant a table of 9,999 delivered rows
+                // destroyed the one live event on every insert, and once EVERY row
+                // was delivered there was no victim at all and the incoming event was
+                // dropped before the INSERT — permanently, for every later event.
+                // Both are the exact loss this file's header forbids.
+                //
+                // Delivered rows are already safely upstream, so reclaiming them
+                // costs nothing. An undelivered event is sacrificed only when no
+                // delivered row remains to give up.
+                const surplus = total - maxRows + 1;
+                const freed = this.db.prepare(`
+                    DELETE FROM usage_outbox WHERE event_id IN (
+                        SELECT event_id FROM usage_outbox
+                         WHERE status = 'delivered'
+                         ORDER BY created_at ASC LIMIT ?
+                    )
+                `).run(surplus).changes ?? 0;
+                if (freed < surplus) {
+                    const sacrificed = this.db.prepare(`
+                        DELETE FROM usage_outbox WHERE event_id IN (
+                            SELECT event_id FROM usage_outbox
+                             WHERE status != 'delivered'
+                             ORDER BY created_at ASC LIMIT ?
+                        )
+                    `).run(surplus - freed).changes ?? 0;
+                    // Losing an undelivered event IS the loss this queue exists to
+                    // prevent. It must never be silent — the previous code evicted
+                    // one and still returned 'queued', so nothing counted it.
+                    if (sacrificed > 0) {
+                        console.warn(`[DatabaseManager] usage_outbox at cap (${maxRows}) — discarded ${sacrificed} UNDELIVERED event(s) to enqueue a new one`);
+                    }
+                }
+                // Deliberately fall through to the INSERT even if nothing could be
+                // freed: bounding the table is worth less than the incoming event.
+            }
+            const res = this.db.prepare(`
+                INSERT OR IGNORE INTO usage_outbox (event_id, layer, payload_json, status, created_at, next_retry_at)
+                VALUES (?, ?, ?, 'pending', ?, 0)
+            `).run(eventId, layer, JSON.stringify(payload), Date.now());
+            return res.changes > 0 ? 'queued' : 'duplicate';
+        } catch (e: any) {
+            console.warn('[DatabaseManager] enqueueUsageEvent failed:', e?.message || e);
+            return 'unavailable';
+        }
+    }
+
+    /** Events due for delivery now, oldest first. */
+    public claimUsageOutboxBatch(limit = 100, now = Date.now()): Array<{ event_id: string; layer: string; payload: any; attempt_count: number }> {
+        if (!this.db) return [];
+        try {
+            const rows = this.db.prepare(`
+                SELECT event_id, layer, payload_json, attempt_count
+                  FROM usage_outbox
+                 WHERE status = 'pending' AND next_retry_at <= ?
+                 ORDER BY created_at ASC
+                 LIMIT ?
+            `).all(now, limit) as any[];
+            return rows.map((r) => ({
+                event_id: r.event_id,
+                layer: r.layer,
+                attempt_count: r.attempt_count,
+                payload: JSON.parse(r.payload_json),
+            }));
+        } catch (e: any) {
+            console.warn('[DatabaseManager] claimUsageOutboxBatch failed:', e?.message || e);
+            return [];
+        }
+    }
+
+    /** Mark delivered. Rows linger until compaction so a duplicate enqueue is caught. */
+    public markUsageEventsDelivered(eventIds: string[], now = Date.now()): void {
+        if (!this.db || eventIds.length === 0) return;
+        try {
+            const stmt = this.db.prepare(`UPDATE usage_outbox SET status = 'delivered', delivered_at = ?, last_error = NULL WHERE event_id = ?`);
+            const tx = this.db.transaction((ids: string[]) => { for (const id of ids) stmt.run(now, id); });
+            tx(eventIds);
+        } catch (e: any) {
+            console.warn('[DatabaseManager] markUsageEventsDelivered failed:', e?.message || e);
+        }
+    }
+
+    /**
+     * Server said these are permanently unacceptable (schema rejection).
+     * Deleted rather than retried: a payload this server build refuses will be
+     * refused identically forever, and retrying it is how a queue wedges.
+     */
+    public dropUsageEvents(eventIds: string[]): void {
+        if (!this.db || eventIds.length === 0) return;
+        try {
+            const stmt = this.db.prepare(`DELETE FROM usage_outbox WHERE event_id = ?`);
+            const tx = this.db.transaction((ids: string[]) => { for (const id of ids) stmt.run(id); });
+            tx(eventIds);
+        } catch (e: any) {
+            console.warn('[DatabaseManager] dropUsageEvents failed:', e?.message || e);
+        }
+    }
+
+    /** Record a failed attempt and schedule the next one. */
+    public markUsageEventsFailed(eventIds: string[], nextRetryAt: number, error: string): void {
+        if (!this.db || eventIds.length === 0) return;
+        try {
+            const msg = String(error || '').slice(0, 200);
+            const stmt = this.db.prepare(`
+                UPDATE usage_outbox
+                   SET attempt_count = attempt_count + 1, next_retry_at = ?, last_error = ?
+                 WHERE event_id = ?
+            `);
+            const tx = this.db.transaction((ids: string[]) => { for (const id of ids) stmt.run(nextRetryAt, msg, id); });
+            tx(eventIds);
+        } catch (e: any) {
+            console.warn('[DatabaseManager] markUsageEventsFailed failed:', e?.message || e);
+        }
+    }
+
+    /** Remove delivered rows older than the retention window (default 7 days). */
+    public compactUsageOutbox(olderThanMs = 7 * 24 * 60 * 60 * 1000, now = Date.now()): number {
+        if (!this.db) return 0;
+        try {
+            const res = this.db.prepare(
+                `DELETE FROM usage_outbox WHERE status = 'delivered' AND delivered_at IS NOT NULL AND delivered_at < ?`
+            ).run(now - olderThanMs);
+            return res.changes ?? 0;
+        } catch (e: any) {
+            console.warn('[DatabaseManager] compactUsageOutbox failed:', e?.message || e);
+            return 0;
+        }
+    }
+
+    /** Queue depth by status — the §20 `event_queue_depth` health metric. */
+    public getUsageOutboxStats(): { pending: number; delivered: number; total: number; oldestPendingAgeMs: number | null } {
+        if (!this.db) return { pending: 0, delivered: 0, total: 0, oldestPendingAgeMs: null };
+        try {
+            const rows = this.db.prepare(`SELECT status, COUNT(*) AS n FROM usage_outbox GROUP BY status`).all() as any[];
+            const byStatus = Object.fromEntries(rows.map((r) => [r.status, r.n]));
+            const oldest = this.db.prepare(
+                `SELECT MIN(created_at) AS t FROM usage_outbox WHERE status = 'pending'`
+            ).get() as any;
+            return {
+                pending: byStatus.pending ?? 0,
+                delivered: byStatus.delivered ?? 0,
+                total: rows.reduce((s, r) => s + r.n, 0),
+                oldestPendingAgeMs: oldest?.t ? Date.now() - oldest.t : null,
+            };
+        } catch {
+            return { pending: 0, delivered: 0, total: 0, oldestPendingAgeMs: null };
+        }
+    }
+
+    // ============================================
+    // Context OS — assistant claims + turn contracts (v24, Phase 9)
+    // ============================================
+
+    /** Insert an extracted assistant claim (default validation_status='unverified'). */
+    public saveAssistantClaim(claim: {
+        claimId: string;
+        turnId: string;
+        claimText: string;
+        sourceOwner: string;
+        requestedProperty?: string | null;
+        validationStatus?: 'unverified' | 'verified' | 'contradicted';
+        evidenceIds?: string[];
+    }): void {
+        if (!this.db) return;
+        // Context OS invariant (Phase 7): a VERIFIED claim MUST carry evidence
+        // IDs — a verified claim with no provenance is exactly the contamination
+        // trap the claims table exists to prevent. Enforce fail-closed at the DAO
+        // boundary: downgrade rather than store an unprovable "verified" row.
+        let status = claim.validationStatus ?? 'unverified';
+        const evidenceIds = claim.evidenceIds ?? [];
+        if (status === 'verified' && evidenceIds.length === 0) {
+            console.warn('[DatabaseManager] refusing to store verified claim without evidence IDs — downgrading to unverified');
+            status = 'unverified';
+        }
+        try {
+            this.db.prepare(`
+                INSERT OR REPLACE INTO assistant_claims
+                    (claim_id, turn_id, claim_text, source_owner, requested_property, validation_status, evidence_ids_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                claim.claimId,
+                claim.turnId,
+                claim.claimText,
+                claim.sourceOwner,
+                claim.requestedProperty ?? null,
+                status,
+                JSON.stringify(evidenceIds),
+            );
+        } catch (e) {
+            console.error('[DatabaseManager] saveAssistantClaim failed:', e);
+        }
+    }
+
+    /** Only VERIFIED claims may be re-used as evidence (memory-safety invariant). */
+    public getVerifiedAssistantClaims(limit = 50): any[] {
+        if (!this.db) return [];
+        try {
+            return this.db.prepare(`
+                SELECT * FROM assistant_claims
+                WHERE validation_status = 'verified'
+                ORDER BY created_at DESC LIMIT ?
+            `).all(limit);
+        } catch (e) {
+            console.error('[DatabaseManager] getVerifiedAssistantClaims failed:', e);
+            return [];
+        }
+    }
+
+    /**
+     * Phase 6 Slice 7 (context-rebuild, 2026-07-25, RC8 precedence
+     * enforcement): the read-side counterpart to getVerifiedAssistantClaims
+     * needed to check whether a draft answer restates a claim already
+     * marked contradicted from an earlier turn.
+     */
+    public getContradictedAssistantClaims(limit = 50): any[] {
+        if (!this.db) return [];
+        try {
+            return this.db.prepare(`
+                SELECT * FROM assistant_claims
+                WHERE validation_status = 'contradicted'
+                ORDER BY created_at DESC LIMIT ?
+            `).all(limit);
+        } catch (e) {
+            console.error('[DatabaseManager] getContradictedAssistantClaims failed:', e);
+            return [];
+        }
+    }
+
+    /** Mark a stored claim contradicted by newer evidence (never deleted — audit trail). */
+    public markAssistantClaimContradicted(claimId: string, contradictedByClaimId?: string | null): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare(`
+                UPDATE assistant_claims
+                SET validation_status = 'contradicted', contradicted_by_claim_id = ?
+                WHERE claim_id = ?
+            `).run(contradictedByClaimId ?? null, claimId);
+        } catch (e) {
+            console.error('[DatabaseManager] markAssistantClaimContradicted failed:', e);
+        }
+    }
+
+    /** Persist the privacy-safe per-turn contract snapshot (no content, source kinds only). */
+    public saveTurnContextContract(row: {
+        turnId: string;
+        surface: string;
+        activeModeId?: string | null;
+        answerShape: string;
+        sourceOwner: string;
+        requestedProperty?: string | null;
+        allowedSources: string[];
+        forbiddenSources: string[];
+        memoryWritePolicy: Record<string, boolean>;
+    }): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare(`
+                INSERT OR REPLACE INTO turn_context_contracts
+                    (turn_id, surface, active_mode_id, answer_shape, source_owner, requested_property,
+                     allowed_sources_json, forbidden_sources_json, memory_write_policy_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                row.turnId,
+                row.surface,
+                row.activeModeId ?? null,
+                row.answerShape,
+                row.sourceOwner,
+                row.requestedProperty ?? null,
+                JSON.stringify(row.allowedSources),
+                JSON.stringify(row.forbiddenSources),
+                JSON.stringify(row.memoryWritePolicy),
+            );
+        } catch (e) {
+            console.error('[DatabaseManager] saveTurnContextContract failed:', e);
+        }
+    }
+
+
+    // ============================================
+    // Modes CRUD
+    // ============================================
+
+    public getModes(): any[] {
+        if (!this.db) return [];
+        try {
+            return this.db.prepare('SELECT * FROM modes ORDER BY created_at ASC').all();
+        } catch (e) {
+            console.error('[DatabaseManager] getModes failed:', e);
+            return [];
+        }
+    }
+
+    public getActiveMode(): any | null {
+        if (!this.db) return null;
+        try {
+            return this.db.prepare('SELECT * FROM modes WHERE is_active = 1 LIMIT 1').get() ?? null;
+        } catch (e) {
+            console.error('[DatabaseManager] getActiveMode failed:', e);
+            return null;
+        }
+    }
+
+    public createMode(mode: { id: string; name: string; templateType: string; customContext: string; sourceContractJson?: string }): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare(`
+                INSERT INTO modes (id, name, template_type, custom_context, is_active, source_contract_json)
+                VALUES (?, ?, ?, ?, 0, ?)
+            `).run(mode.id, mode.name, mode.templateType, mode.customContext, mode.sourceContractJson ?? null);
+        } catch (e) {
+            console.error('[DatabaseManager] createMode failed:', e);
+        }
+    }
+
+    /** Mark/unmark a mode as an app default (migration v26). */
+    public setModeBuiltin(id: string, isBuiltin: boolean): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare('UPDATE modes SET is_builtin = ? WHERE id = ?').run(isBuiltin ? 1 : 0, id);
+        } catch (e) {
+            console.error('[DatabaseManager] setModeBuiltin failed:', e);
+        }
+    }
+
+    public updateMode(id: string, updates: { name?: string; templateType?: string; customContext?: string; sourceContractJson?: string | null }): void {
+        if (!this.db) return;
+        try {
+            if (updates.name !== undefined) {
+                this.db.prepare('UPDATE modes SET name = ? WHERE id = ?').run(updates.name, id);
+            }
+            if (updates.templateType !== undefined) {
+                this.db.prepare('UPDATE modes SET template_type = ? WHERE id = ?').run(updates.templateType, id);
+            }
+            if (updates.customContext !== undefined) {
+                this.db.prepare('UPDATE modes SET custom_context = ? WHERE id = ?').run(updates.customContext, id);
+            }
+            if (updates.sourceContractJson !== undefined) {
+                this.db.prepare('UPDATE modes SET source_contract_json = ? WHERE id = ?').run(updates.sourceContractJson, id);
+            }
+        } catch (e) {
+            console.error('[DatabaseManager] updateMode failed:', e);
+        }
+    }
+
+    public deleteMode(id: string): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare('DELETE FROM modes WHERE id = ?').run(id);
+        } catch (e) {
+            console.error('[DatabaseManager] deleteMode failed:', e);
+        }
+    }
+
+    public setActiveMode(id: string | null): void {
+        if (!this.db) return;
+        try {
+            const txn = this.db.transaction(() => {
+                this.db!.prepare('UPDATE modes SET is_active = 0').run();
+                if (id) {
+                    const result = this.db!.prepare('UPDATE modes SET is_active = 1 WHERE id = ?').run(id);
+                    if (result.changes === 0) {
+                        console.warn(`[DatabaseManager] setActiveMode: no mode found with id "${id}" — active mode cleared`);
+                    }
+                }
+            });
+            txn();
+        } catch (e) {
+            console.error('[DatabaseManager] setActiveMode failed:', e);
+        }
+    }
+
+    public getReferenceFiles(modeId: string): any[] {
+        if (!this.db) return [];
+        try {
+            return this.db.prepare('SELECT * FROM mode_reference_files WHERE mode_id = ? ORDER BY created_at ASC').all(modeId);
+        } catch (e) {
+            console.error('[DatabaseManager] getReferenceFiles failed:', e);
+            return [];
+        }
+    }
+
+    public addReferenceFile(file: {
+        id: string;
+        modeId: string;
+        fileName: string;
+        content: string;
+        pageCount?: number;
+        extractedPageCount?: number;
+    }): void {
+        if (!this.db) throw new Error('Database not initialized');
+        try {
+            this.db.prepare(`
+                INSERT INTO mode_reference_files (id, mode_id, file_name, content, page_count, extracted_page_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `).run(
+                file.id,
+                file.modeId,
+                file.fileName,
+                file.content,
+                file.pageCount ?? null,
+                file.extractedPageCount ?? null,
+            );
+        } catch (e) {
+            console.error('[DatabaseManager] addReferenceFile failed:', e);
+            throw e;
+        }
+    }
+
+    public deleteReferenceFile(id: string): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare('DELETE FROM mode_reference_files WHERE id = ?').run(id);
+        } catch (e) {
+            console.error('[DatabaseManager] deleteReferenceFile failed:', e);
+        }
+    }
+
+    // ── OKF Knowledge Packs (Phase 2) ───────────────────────────────
+    // CRUD for knowledge_sources/knowledge_packs/knowledge_cards/knowledge_entities/
+    // knowledge_relations/knowledge_index_versions. All rows cascade-delete via FK
+    // when the owning mode_reference_files / modes row is deleted — see migration
+    // v19→v20. Row shapes are intentionally untyped (`any`) at this layer; typed
+    // mapping happens in electron/services/knowledge/KnowledgePackStore.ts.
+
+    public upsertKnowledgeSource(source: {
+        id: string; type: string; fileId?: string; modeId?: string; fileName?: string;
+        sourceChecksum: string; contentHash: string; indexedAt?: string;
+        pageCount?: number; extractedPageCount?: number; indexVersion?: string; embeddingSpace?: string;
+    }): void {
+        if (!this.db) throw new Error('Database not initialized');
+        this.db.prepare(`
+            INSERT INTO knowledge_sources (id, type, file_id, mode_id, file_name, source_checksum, content_hash, indexed_at, page_count, extracted_page_count, index_version, embedding_space)
+            VALUES (@id, @type, @fileId, @modeId, @fileName, @sourceChecksum, @contentHash, @indexedAt, @pageCount, @extractedPageCount, @indexVersion, @embeddingSpace)
+            ON CONFLICT(id) DO UPDATE SET
+                source_checksum = excluded.source_checksum,
+                content_hash = excluded.content_hash,
+                indexed_at = excluded.indexed_at,
+                page_count = excluded.page_count,
+                extracted_page_count = excluded.extracted_page_count,
+                index_version = excluded.index_version,
+                embedding_space = excluded.embedding_space
+        `).run({
+            id: source.id, type: source.type, fileId: source.fileId ?? null, modeId: source.modeId ?? null,
+            fileName: source.fileName ?? null, sourceChecksum: source.sourceChecksum, contentHash: source.contentHash,
+            indexedAt: source.indexedAt ?? null, pageCount: source.pageCount ?? null, extractedPageCount: source.extractedPageCount ?? null,
+            indexVersion: source.indexVersion ?? 'knowledge_pack_v1', embeddingSpace: source.embeddingSpace ?? null,
+        });
+    }
+
+    public getKnowledgeSourceByFileId(fileId: string): any | null {
+        if (!this.db) return null;
+        return this.db.prepare('SELECT * FROM knowledge_sources WHERE file_id = ? ORDER BY created_at DESC LIMIT 1').get(fileId) || null;
+    }
+
+    public getKnowledgeSourceById(id: string): any | null {
+        if (!this.db) return null;
+        return this.db.prepare('SELECT * FROM knowledge_sources WHERE id = ?').get(id) || null;
+    }
+
+    public getKnowledgeSourcesByModeId(modeId: string): any[] {
+        if (!this.db) return [];
+        return this.db.prepare('SELECT * FROM knowledge_sources WHERE mode_id = ?').all(modeId);
+    }
+
+    /**
+     * Explicit cascade delete for a knowledge_sources row and everything
+     * hanging off it (packs, cards, entities, relations, index versions).
+     *
+     * NOTE (2026-07-10): `PRAGMA foreign_keys = ON` is now enabled directly in
+     * initialize() on the shared connection, so the `ON DELETE CASCADE` clauses
+     * on these tables ARE enforced at runtime and a bare parent delete would
+     * cascade. This method's manual, dependency-ordered delete is kept as
+     * belt-and-suspenders: it is harmless with FK enforcement on, and it keeps
+     * this path correct (and self-documenting about the reap order) regardless of
+     * pragma state. Deletes children before the pack, pack before the source,
+     * inside one transaction so a mid-delete failure can't leave a partial pack.
+     */
+    public deleteKnowledgeSource(id: string): void {
+        if (!this.db) return;
+        const txn = this.db.transaction(() => {
+            const packs = this.db!.prepare('SELECT id FROM knowledge_packs WHERE source_id = ?').all(id) as Array<{ id: string }>;
+            for (const { id: packId } of packs) {
+                this.db!.prepare('DELETE FROM knowledge_relations WHERE pack_id = ?').run(packId);
+                this.db!.prepare('DELETE FROM knowledge_entities WHERE pack_id = ?').run(packId);
+                // knowledge_card_versions cascades off knowledge_cards.id, not pack_id directly.
+                this.db!.prepare(`
+                    DELETE FROM knowledge_card_versions
+                    WHERE card_id IN (SELECT id FROM knowledge_cards WHERE pack_id = ?)
+                `).run(packId);
+                this.db!.prepare('DELETE FROM knowledge_cards WHERE pack_id = ?').run(packId);
+            }
+            this.db!.prepare('DELETE FROM knowledge_packs WHERE source_id = ?').run(id);
+            this.db!.prepare('DELETE FROM knowledge_index_versions WHERE source_id = ?').run(id);
+            this.db!.prepare('DELETE FROM knowledge_sources WHERE id = ?').run(id);
+        });
+        txn();
+    }
+
+    public upsertKnowledgePack(pack: {
+        id: string; sourceId: string; modeId: string; fileName: string;
+        indexMd: string; statsJson: string; packVersion: number; generatedBy: string;
+    }): void {
+        if (!this.db) throw new Error('Database not initialized');
+        this.db.prepare(`
+            INSERT INTO knowledge_packs (id, source_id, mode_id, file_name, index_md, stats_json, pack_version, generated_by, updated_at)
+            VALUES (@id, @sourceId, @modeId, @fileName, @indexMd, @statsJson, @packVersion, @generatedBy, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                index_md = excluded.index_md,
+                stats_json = excluded.stats_json,
+                pack_version = excluded.pack_version,
+                updated_at = CURRENT_TIMESTAMP
+        `).run(pack);
+    }
+
+    public getKnowledgePackBySourceId(sourceId: string): any | null {
+        if (!this.db) return null;
+        return this.db.prepare('SELECT * FROM knowledge_packs WHERE source_id = ? ORDER BY updated_at DESC LIMIT 1').get(sourceId) || null;
+    }
+
+    public getKnowledgePacksByModeId(modeId: string): any[] {
+        if (!this.db) return [];
+        return this.db.prepare('SELECT * FROM knowledge_packs WHERE mode_id = ? ORDER BY updated_at DESC').all(modeId);
+    }
+
+    public deleteKnowledgePack(id: string): void {
+        if (!this.db) return;
+        this.db.prepare('DELETE FROM knowledge_packs WHERE id = ?').run(id);
+    }
+
+    public replaceKnowledgeCards(packId: string, sourceId: string, cards: Array<{
+        id: string; type: string; title: string; slug: string; conceptId: string;
+        body: string; bodyMarkdown?: string; sourcePagesJson: string; sourceSectionsJson: string;
+        sourceQuotesJson: string; entitiesJson: string; tagsJson: string; relatedCardIdsJson: string;
+        confidence: string; generatedFrom: string; sourceChecksum: string; cardVersion: number;
+        pii?: boolean;
+    }>, newSourceChecksum?: string): void {
+        if (!this.db) throw new Error('Database not initialized');
+        const txn = this.db.transaction(() => {
+            // OKF Phase 6: a user-edited card whose source_checksum no longer
+            // matches the freshly-extracted content (the underlying document
+            // changed since the edit) is flagged needs_review instead of being
+            // silently kept stale or silently overwritten. The card body
+            // itself is left untouched — only the review flag changes.
+            //
+            // BUG FIX (2026-07-01, senior review): this used to derive the new
+            // checksum from `cards[0]?.sourceChecksum` — if a regeneration
+            // produces ZERO cards (content too short/unparseable to extract
+            // any section, or every candidate rejected by OkfVerifier),
+            // `cards[0]` is undefined, the checksum falls through to
+            // `undefined`, the `if (newChecksum)` guard is falsy, and this
+            // UPDATE never runs — a user-edited card whose source became
+            // degenerate silently keeps its stale approval_status forever,
+            // exactly the "silently kept stale" outcome this mechanism exists
+            // to prevent. Callers now pass the checksum explicitly (always
+            // known — it's the content hash of what was JUST extracted,
+            // regardless of how many cards came out of it).
+            if (newSourceChecksum) {
+                this.db!.prepare(`
+                    UPDATE knowledge_cards SET approval_status = 'needs_review'
+                    WHERE pack_id = ? AND user_edited = 1 AND source_checksum != ? AND approval_status != 'needs_review'
+                `).run(packId, newSourceChecksum);
+            }
+            this.db!.prepare('DELETE FROM knowledge_cards WHERE pack_id = ? AND user_edited = 0').run(packId);
+            const ins = this.db!.prepare(`
+                INSERT INTO knowledge_cards (id, pack_id, source_id, type, title, slug, concept_id, body, body_markdown,
+                    source_pages_json, source_sections_json, source_quotes_json, entities_json, tags_json, related_card_ids_json,
+                    confidence, generated_from, source_checksum, updated_at, card_version, pii)
+                VALUES (@id, @packId, @sourceId, @type, @title, @slug, @conceptId, @body, @bodyMarkdown,
+                    @sourcePagesJson, @sourceSectionsJson, @sourceQuotesJson, @entitiesJson, @tagsJson, @relatedCardIdsJson,
+                    @confidence, @generatedFrom, @sourceChecksum, CURRENT_TIMESTAMP, @cardVersion, @pii)
+                ON CONFLICT(id) DO UPDATE SET
+                    body = excluded.body, body_markdown = excluded.body_markdown,
+                    source_pages_json = excluded.source_pages_json, source_sections_json = excluded.source_sections_json,
+                    source_quotes_json = excluded.source_quotes_json, entities_json = excluded.entities_json,
+                    tags_json = excluded.tags_json, related_card_ids_json = excluded.related_card_ids_json,
+                    confidence = excluded.confidence, source_checksum = excluded.source_checksum,
+                    updated_at = CURRENT_TIMESTAMP, card_version = excluded.card_version, pii = excluded.pii
+                WHERE knowledge_cards.user_edited = 0
+            `);
+            for (const c of cards) {
+                ins.run({ ...c, packId, sourceId, bodyMarkdown: c.bodyMarkdown ?? null, pii: c.pii ? 1 : 0 });
+            }
+        });
+        txn();
+    }
+
+    public getKnowledgeCardsByPackId(packId: string): any[] {
+        if (!this.db) return [];
+        return this.db.prepare('SELECT * FROM knowledge_cards WHERE pack_id = ? ORDER BY rowid ASC').all(packId);
+    }
+
+    public replaceKnowledgeEntities(packId: string, entities: Array<{
+        id: string; slug: string; name: string; type: string; aliasesJson: string;
+        description: string; sourceCardIdsJson: string; sourcePagesJson: string;
+    }>): void {
+        if (!this.db) throw new Error('Database not initialized');
+        const txn = this.db.transaction(() => {
+            this.db!.prepare('DELETE FROM knowledge_entities WHERE pack_id = ?').run(packId);
+            // Defense-in-depth: OkfExtractor.extractEntityCards is the
+            // primary dedup boundary (keys by slugify(name), matching this
+            // row's id derivation), but a bare INSERT here would abort the
+            // WHOLE transaction — including the entities inserted before
+            // the colliding row — on any future extraction-side regression
+            // that reintroduces a duplicate slug. ON CONFLICT DO UPDATE
+            // makes a same-id collision within one pack a harmless
+            // last-write-wins merge instead of a thrown exception that
+            // silently drops every entity (see the 2026-07-01 "Mercury
+            // X1"/"The Mercury X1" incident this fixed at the source).
+            const ins = this.db!.prepare(`
+                INSERT INTO knowledge_entities (id, pack_id, slug, name, type, aliases_json, description, source_card_ids_json, source_pages_json)
+                VALUES (@id, @packId, @slug, @name, @type, @aliasesJson, @description, @sourceCardIdsJson, @sourcePagesJson)
+                ON CONFLICT(id) DO UPDATE SET
+                    slug = excluded.slug, name = excluded.name, type = excluded.type,
+                    aliases_json = excluded.aliases_json, description = excluded.description,
+                    source_card_ids_json = excluded.source_card_ids_json, source_pages_json = excluded.source_pages_json
+            `);
+            for (const e of entities) ins.run({ ...e, packId });
+        });
+        txn();
+    }
+
+    public getKnowledgeEntitiesByPackId(packId: string): any[] {
+        if (!this.db) return [];
+        return this.db.prepare('SELECT * FROM knowledge_entities WHERE pack_id = ? ORDER BY rowid ASC').all(packId);
+    }
+
+    public replaceKnowledgeRelations(packId: string, relations: Array<{
+        id: string; subjectId: string; subjectType: string; predicate: string; objectId: string; objectType: string;
+        sourceCardIdsJson: string; sourcePagesJson: string; confidence: string;
+    }>): void {
+        if (!this.db) throw new Error('Database not initialized');
+        const txn = this.db.transaction(() => {
+            this.db!.prepare('DELETE FROM knowledge_relations WHERE pack_id = ?').run(packId);
+            // Defense-in-depth: same reasoning as replaceKnowledgeEntities
+            // above — GraphExtractor already dedupes relations by
+            // `${subjectId}|${predicate}|${objectId}` before emitting, but a
+            // bare INSERT here would still abort the whole transaction (and
+            // drop every relation already inserted) on any future
+            // extraction-side regression. ON CONFLICT DO UPDATE degrades a
+            // same-id collision to a harmless merge instead.
+            const ins = this.db!.prepare(`
+                INSERT INTO knowledge_relations (id, pack_id, subject_id, subject_type, predicate, object_id, object_type, source_card_ids_json, source_pages_json, confidence)
+                VALUES (@id, @packId, @subjectId, @subjectType, @predicate, @objectId, @objectType, @sourceCardIdsJson, @sourcePagesJson, @confidence)
+                ON CONFLICT(id) DO UPDATE SET
+                    subject_id = excluded.subject_id, subject_type = excluded.subject_type,
+                    predicate = excluded.predicate, object_id = excluded.object_id, object_type = excluded.object_type,
+                    source_card_ids_json = excluded.source_card_ids_json, source_pages_json = excluded.source_pages_json,
+                    confidence = excluded.confidence
+            `);
+            for (const r of relations) ins.run({ ...r, packId });
+        });
+        txn();
+    }
+
+    public getKnowledgeRelationsByPackId(packId: string): any[] {
+        if (!this.db) return [];
+        return this.db.prepare('SELECT * FROM knowledge_relations WHERE pack_id = ? ORDER BY rowid ASC').all(packId);
+    }
+
+    public upsertKnowledgeIndexVersion(v: {
+        id: string; sourceId: string; packId?: string; packVersion: number; contentHash: string;
+        embeddingSpace?: string; status: string; errorMessage?: string;
+    }): void {
+        if (!this.db) throw new Error('Database not initialized');
+        this.db.prepare(`
+            INSERT INTO knowledge_index_versions (id, source_id, pack_id, pack_version, content_hash, embedding_space, status, error_message, updated_at)
+            VALUES (@id, @sourceId, @packId, @packVersion, @contentHash, @embeddingSpace, @status, @errorMessage, CURRENT_TIMESTAMP)
+            ON CONFLICT(id) DO UPDATE SET
+                pack_id = excluded.pack_id, pack_version = excluded.pack_version, content_hash = excluded.content_hash,
+                embedding_space = excluded.embedding_space, status = excluded.status, error_message = excluded.error_message,
+                updated_at = CURRENT_TIMESTAMP
+        `).run({
+            id: v.id, sourceId: v.sourceId, packId: v.packId ?? null, packVersion: v.packVersion,
+            contentHash: v.contentHash, embeddingSpace: v.embeddingSpace ?? null, status: v.status,
+            errorMessage: v.errorMessage ?? null,
+        });
+    }
+
+    public getKnowledgeIndexVersionBySourceId(sourceId: string): any | null {
+        if (!this.db) return null;
+        return this.db.prepare('SELECT * FROM knowledge_index_versions WHERE source_id = ? ORDER BY updated_at DESC LIMIT 1').get(sourceId) || null;
+    }
+
+    // ── OKF Knowledge Card edit/approval (Phase 6) ──────────────────
+
+    public getKnowledgeCardById(id: string): any | null {
+        if (!this.db) return null;
+        return this.db.prepare('SELECT * FROM knowledge_cards WHERE id = ?').get(id) || null;
+    }
+
+    /**
+     * Snapshots the card's CURRENT row into knowledge_card_versions, then
+     * applies the edit and marks the card user_edited=1 (so it survives the
+     * next regenerate() call's `WHERE user_edited = 0` guard). Called before
+     * every edit/approve/reject so the prior state is never lost.
+     */
+    public snapshotKnowledgeCardVersion(cardId: string, editedBy: string, editReason?: string): void {
+        if (!this.db) return;
+        const card = this.getKnowledgeCardById(cardId);
+        if (!card) return;
+        this.db.prepare(`
+            INSERT INTO knowledge_card_versions (id, card_id, card_version, title, body, entities_json, tags_json, confidence, edited_by, edit_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            `kcv_${cardId}_v${card.card_version}_${Date.now()}`,
+            cardId, card.card_version, card.title, card.body, card.entities_json, card.tags_json, card.confidence,
+            editedBy, editReason ?? null,
+        );
+    }
+
+    public getKnowledgeCardVersions(cardId: string): any[] {
+        if (!this.db) return [];
+        return this.db.prepare('SELECT * FROM knowledge_card_versions WHERE card_id = ? ORDER BY created_at DESC').all(cardId);
+    }
+
+    public updateKnowledgeCard(id: string, updates: {
+        title?: string; body?: string; entitiesJson?: string; tagsJson?: string; confidence?: string;
+        userEdited?: boolean; approvalStatus?: string;
+    }): void {
+        if (!this.db) return;
+        const sets: string[] = [];
+        const values: any[] = [];
+        if (updates.title !== undefined) { sets.push('title = ?'); values.push(updates.title); }
+        if (updates.body !== undefined) { sets.push('body = ?'); values.push(updates.body); }
+        if (updates.entitiesJson !== undefined) { sets.push('entities_json = ?'); values.push(updates.entitiesJson); }
+        if (updates.tagsJson !== undefined) { sets.push('tags_json = ?'); values.push(updates.tagsJson); }
+        if (updates.confidence !== undefined) { sets.push('confidence = ?'); values.push(updates.confidence); }
+        if (updates.userEdited !== undefined) { sets.push('user_edited = ?'); values.push(updates.userEdited ? 1 : 0); }
+        if (updates.approvalStatus !== undefined) { sets.push('approval_status = ?'); values.push(updates.approvalStatus); }
+        if (sets.length === 0) return;
+        sets.push('card_version = card_version + 1', 'updated_at = CURRENT_TIMESTAMP');
+        values.push(id);
+        this.db.prepare(`UPDATE knowledge_cards SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+    }
+
+    // ── Note Sections ─────────────────────────────────────────────
+
+    public getNoteSections(modeId: string): any[] {
+        if (!this.db) return [];
+        try {
+            return this.db.prepare(
+                'SELECT * FROM mode_note_sections WHERE mode_id = ? ORDER BY sort_order ASC, created_at ASC'
+            ).all(modeId);
+        } catch (e) {
+            console.error('[DatabaseManager] getNoteSections failed:', e);
+            return [];
+        }
+    }
+
+    public addNoteSection(section: { id: string; modeId: string; title: string; description: string; sortOrder: number }): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare(`
+                INSERT INTO mode_note_sections (id, mode_id, title, description, sort_order)
+                VALUES (?, ?, ?, ?, ?)
+            `).run(section.id, section.modeId, section.title, section.description, section.sortOrder);
+        } catch (e) {
+            console.error('[DatabaseManager] addNoteSection failed:', e);
+        }
+    }
+
+    public updateNoteSection(id: string, updates: { title?: string; description?: string; sortOrder?: number; compiledPrompt?: string }): void {
+        if (!this.db) return;
+        try {
+            if (updates.title !== undefined) {
+                this.db.prepare('UPDATE mode_note_sections SET title = ? WHERE id = ?').run(updates.title, id);
+            }
+            if (updates.description !== undefined) {
+                this.db.prepare('UPDATE mode_note_sections SET description = ? WHERE id = ?').run(updates.description, id);
+            }
+            if (updates.sortOrder !== undefined) {
+                this.db.prepare('UPDATE mode_note_sections SET sort_order = ? WHERE id = ?').run(updates.sortOrder, id);
+            }
+            if (updates.compiledPrompt !== undefined) {
+                try { this.db.prepare('UPDATE mode_note_sections SET compiled_prompt = ? WHERE id = ?').run(updates.compiledPrompt, id); } catch { /* column may not exist on very old DB */ }
+            }
+        } catch (e) {
+            console.error('[DatabaseManager] updateNoteSection failed:', e);
+        }
+    }
+
+    /** Look up the mode that owns a given note-section id (used by the prompt compiler). */
+    public getNoteSectionOwnerMode(sectionId: string): { sectionId: string; modeId: string; title: string; description: string; templateType?: string } | null {
+        if (!this.db) return null;
+        try {
+            const row = this.db.prepare(`
+                SELECT s.id as section_id, s.mode_id, s.title, s.description, m.template_type
+                FROM mode_note_sections s JOIN modes m ON m.id = s.mode_id
+                WHERE s.id = ?
+            `).get(sectionId) as any;
+            if (!row) return null;
+            return { sectionId: row.section_id, modeId: row.mode_id, title: row.title, description: row.description, templateType: row.template_type };
+        } catch (e) {
+            console.error('[DatabaseManager] getNoteSectionOwnerMode failed:', e);
+            return null;
+        }
+    }
+
+    public deleteNoteSection(id: string): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare('DELETE FROM mode_note_sections WHERE id = ?').run(id);
+        } catch (e) {
+            console.error('[DatabaseManager] deleteNoteSection failed:', e);
+        }
+    }
+
+    public deleteAllNoteSections(modeId: string): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare('DELETE FROM mode_note_sections WHERE mode_id = ?').run(modeId);
+        } catch (e) {
+            console.error('[DatabaseManager] deleteAllNoteSections failed:', e);
+        }
+    }
+
+    // ============================================
+    // System KV Store (app_state)
+    // ============================================
+
+    public getAppState(key: string): string | null {
+        if (!this.db) return null;
+        try {
+            const stmt = this.db.prepare('SELECT value FROM app_state WHERE key = ?');
+            const row = stmt.get(key) as { value: string } | undefined;
+            return row ? row.value : null;
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to get app_state for key: ${key}`, error);
+            return null;
+        }
+    }
+
+    public setAppState(key: string, value: string): void {
+        if (!this.db) return;
+        try {
+            const stmt = this.db.prepare('INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)');
+            stmt.run(key, value);
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to set app_state for key: ${key}`, error);
+        }
+    }
+
+    public deleteAppState(key: string): void {
+        if (!this.db) return;
+        try {
+            const stmt = this.db.prepare('DELETE FROM app_state WHERE key = ?');
+            stmt.run(key);
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to delete app_state for key: ${key}`, error);
+        }
+    }
+
+    /**
+     * One-time migration: Copy existing BLOB embeddings into vec0 virtual tables.
+     */
+    private migrateExistingEmbeddings(): void {
+        if (!this.db) return;
+
+        // Migrate chunk embeddings
+        try {
+            const chunkRows = this.db.prepare(
+                'SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL'
+            ).all() as any[];
+
+            if (chunkRows.length > 0) {
+                const insert = this.db.prepare(
+                    'INSERT OR IGNORE INTO vec_chunks(chunk_id, embedding) VALUES (?, ?)'
+                );
+                const migrateAll = this.db.transaction(() => {
+                    for (const row of chunkRows) {
+                        try {
+                            insert.run(row.id, row.embedding);
+                        } catch (err) {
+                            // On mismatch (e.g. mixed 768 and 3072 dims), nullify to re-embed later
+                            this.db!.prepare('UPDATE chunks SET embedding = NULL WHERE id = ?').run(row.id);  // guarded at method entry; narrowing lost in catch
+                        }
+                    }
+                });
+                migrateAll();
+                console.log(`[DatabaseManager] Migrated ${chunkRows.length} chunk embeddings to vec_chunks`);
+            }
+        } catch (e) {
+            console.error('[DatabaseManager] Failed to migrate chunk embeddings:', e);
+        }
+
+        // Migrate summary embeddings
+        try {
+            const summaryRows = this.db.prepare(
+                'SELECT id, embedding FROM chunk_summaries WHERE embedding IS NOT NULL'
+            ).all() as any[];
+
+            if (summaryRows.length > 0) {
+                const insert = this.db.prepare(
+                    'INSERT OR IGNORE INTO vec_summaries(summary_id, embedding) VALUES (?, ?)'
+                );
+                const migrateAll = this.db.transaction(() => {
+                    for (const row of summaryRows) {
+                        try {
+                            insert.run(row.id, row.embedding);
+                        } catch (err) {
+                            this.db!.prepare('UPDATE chunk_summaries SET embedding = NULL WHERE id = ?').run(row.id);  // guarded at method entry; narrowing lost in catch
+                        }
+                    }
+                });
+                migrateAll();
+                console.log(`[DatabaseManager] Migrated ${summaryRows.length} summary embeddings to vec_summaries`);
+            }
+        } catch (e) {
+            console.error('[DatabaseManager] Failed to migrate summary embeddings:', e);
+        }
+    }
+
+    /**
+     * Known embedding dimension tiers.
+     * Used by the v8 migration, delete operations, and table provisioning.
+     * When a new provider dimension is encountered at runtime, ensureVecTableForDim() handles it.
+     */
+    public static readonly KNOWN_DIMS: readonly number[] = [768, 1536, 3072];
+
+    /** Cache: dimensions for which vec0 tables have already been verified/created this session. */
+    private ensuredDims = new Set<number>();
+
+    /**
+     * Vectors per storage block in a vec0 table. sqlite-vec allocates a table's
+     * storage one whole block at a time, and its default block holds 1,024
+     * vectors: at 3,072 dimensions that is 1024 x 3072 x 4 = 12,582,912 bytes
+     * the moment the FIRST vector is inserted. A profile with three embedded
+     * vectors was a 25.9 MB database, and the write went through a 12 MB WAL
+     * (measured 2026-10-04). 64 makes a block 0.8 MB at 3,072 dimensions and
+     * 98 KB at 384, at the cost of more blocks to scan in a large index.
+     */
+    private static readonly VEC_CHUNK_SIZE = 64;
+
+    /**
+     * Fill the vec0 tables for one dimension from the BLOB columns. Returns the
+     * number of vectors inserted. Must run inside the caller's transaction.
+     *
+     * Read in PAGES with .all(), never .iterate(): better-sqlite3 refuses to
+     * run any other statement on a connection while one of its iterators is
+     * open ("This database connection is busy executing a query"). The v30
+     * rebuild inserted from inside an iterate() loop with a per-row
+     * `catch {}`, so every insert threw, every throw was swallowed, and the
+     * migration logged "0 vectors re-inserted" over an index it had just
+     * emptied — the silent blackout its own comment warns about. Reproduced
+     * 2026-10-04 on a copy of a live database.
+     *
+     * A row that will not insert is skipped, but a pass where rows existed and
+     * NONE went in is a broken loop, not bad data, and throws so the caller's
+     * transaction rolls the DROP back.
+     */
+    private reinsertVectorsFromBlobs(db: Database.Database, dim: number, only?: 'chunks' | 'summaries'): number {
+        const bytes = dim * 4;
+        let inserted = 0;
+        let failed = 0;
+        const copy = (sourceTable: 'chunks' | 'chunk_summaries', vecTable: string, idColumn: string) => {
+            const page = db.prepare(
+                `SELECT id, embedding FROM ${sourceTable} WHERE id > ? AND embedding IS NOT NULL AND length(embedding) = ? ORDER BY id LIMIT 500`
+            );
+            // Plain INSERT: every caller has just created the table, so no key
+            // exists yet (and vec0 has no REPLACE to fall back on — vecRowWrite.ts).
+            const insert = db.prepare(`INSERT INTO ${vecTable}(${idColumn}, embedding) VALUES (?, ?)`);
+            let lastId = 0;
+            for (;;) {
+                const rows = page.all(lastId, bytes) as { id: number; embedding: Buffer }[];
+                if (rows.length === 0) break;
+                for (const row of rows) {
+                    try { insert.run(BigInt(row.id), row.embedding); inserted++; } catch { failed++; }
+                    lastId = row.id;
+                }
+            }
+        };
+        if (only !== 'summaries') copy('chunks', `vec_chunks_${dim}`, 'chunk_id');
+        if (only !== 'chunks') copy('chunk_summaries', `vec_summaries_${dim}`, 'summary_id');
+        if (failed > 0 && inserted === 0) {
+            throw new Error(`vec0 rebuild for dim=${dim} inserted none of ${failed} stored vectors`);
+        }
+        if (failed > 0) console.warn(`[DatabaseManager] vec0 rebuild for dim=${dim}: ${failed} stored vector(s) could not be re-inserted`);
+        return inserted;
+    }
+
+    /**
+     * The most stored-vector bytes one launch will copy SYNCHRONOUSLY while
+     * rebuilding vec0 tables. That work runs before the first window, so its
+     * cost must not grow with the index. A table that has to be rebuilt and
+     * does not fit is rebuilt after launch instead (see runPendingVecRebuilds).
+     * Timings measured 2026-10-05 are in
+     * MeetingResaveOriginAndVecBlocks2026_10_04.test.mjs. Mutable so a test
+     * can lower it.
+     */
+    public static vecRebuildBudgetBytes = 16 * 1024 * 1024;
+    /**
+     * The file is only rewritten (VACUUM) to hand the freed blocks back when
+     * what remains is small enough to copy quickly; above this the freed pages
+     * are simply reused as the database grows.
+     */
+    public static vecReclaimMaxLiveBytes = 48 * 1024 * 1024;
+    /** How long after open the deferred rebuilds start, to stay off the launch path. Mutable for tests. */
+    public static vecBackgroundRebuildDelayMs = 8000;
+    /** Stored-vector bytes copied per background slice (about 5 ms, measured), one event-loop turn apart. */
+    private static readonly VEC_BACKGROUND_SLICE_BYTES = 1024 * 1024;
+    private static readonly VEC_BLOCK_SHRINK_SETTLED_KEY = 'vec_block_shrink_settled_v1';
+
+    /**
+     * How a vec0 table differs from the vectors stored in its BLOB column:
+     * the keys that are stored but have no vec0 row, and the vec0 keys nothing
+     * stores any more. Two shipped defects produced both. The v30 rebuild
+     * (2026-08-18) re-inserted nothing, so an install that upgraded through it
+     * has only the vectors embedded since; and until 2026-10-04 re-saving a
+     * meeting deleted its chunk rows by cascade while their vectors stayed
+     * behind. A native query over the first finds no old meeting; over the
+     * second it spends its top-k on rows that no longer exist.
+     *
+     * Asked through vec0's own interface (`SELECT chunk_id FROM <table>`), not
+     * its `_rowids` shadow table: the interface is the part sqlite-vec promises
+     * to keep. Measured at 12,000 vectors: 4 ms and 3 ms for the two queries.
+     * Returns null when it cannot be read — "cannot tell", and the table is
+     * left alone: calling that "wrong" would rework every table on every launch.
+     */
+    private vecTableDrift(db: Database.Database, name: string, kind: 'chunks' | 'summaries', dim: number): { missing: number[]; leftOver: number[] } | null {
+        const source = kind === 'chunks' ? 'chunks' : 'chunk_summaries';
+        const idColumn = kind === 'chunks' ? 'chunk_id' : 'summary_id';
+        try {
+            const missing = (db.prepare(
+                `SELECT s.id AS id FROM ${source} s WHERE s.embedding IS NOT NULL AND length(s.embedding) = ?
+                   AND s.id NOT IN (SELECT ${idColumn} FROM ${name}) ORDER BY s.id`
+            ).all(dim * 4) as { id: number }[]).map(row => Number(row.id));
+            const leftOver = (db.prepare(
+                `SELECT v.${idColumn} AS id FROM ${name} v
+                 WHERE v.${idColumn} NOT IN (SELECT id FROM ${source} WHERE embedding IS NOT NULL AND length(embedding) = ?)`
+            ).all(dim * 4) as { id: number | bigint }[]).map(row => Number(row.id));
+            return { missing, leftOver };
+        } catch (e: any) {
+            console.warn(`[DatabaseManager] Could not compare ${name} with its stored vectors (left as it is):`, e?.message || e);
+            return null;
+        }
+    }
+
+    /** One-time: see the note on stale summary vectors in repairVecTables. */
+    private static readonly VEC_SUMMARY_REWRITE_KEY = 'vec_summary_vectors_rewritten_v1';
+
+    /**
+     * Bring every vec0 table into line with the BLOB columns, which are the
+     * record of what is stored. Driven by each table's own DDL and contents
+     * rather than a schema version, so it covers a table of ANY dimension and
+     * runs on every launch. This is also the body of the v30 migration.
+     *
+     * First, a table is created for every vector width that is stored and has
+     * none (a launch without the extension writes BLOBs only, and the bundled
+     * model's 384 is not a pre-created width). Then each table is one of:
+     *
+     *   - REBUILD — wrong distance metric or an old key type. Nothing in it
+     *     can be trusted, so it is dropped, recreated and refilled.
+     *   - FILL — the right shape, with stored vectors that have no row. Only
+     *     those rows are written; the table is not dropped. Rows whose key is
+     *     no longer stored are simply deleted, here, whatever else happens.
+     *   - SHRINK — correct and complete, but created with the default
+     *     1,024-vector block. Asked once (the settled flag): rebuilt if it fits
+     *     the budget, left for good if it is larger than the whole budget — its
+     *     waste is at most one part-empty block and nothing about it is wrong.
+     *
+     * What is done NOW is one transaction, at most vecRebuildBudgetBytes of
+     * vectors: REBUILD and FILL first, then SHRINK smallest first. A REBUILD
+     * or FILL that does not fit is recorded in app_state (vecRebuildPending.ts)
+     * and done after launch by runPendingVecRebuilds(); VectorStore searches a
+     * recorded table through the JS cosine path until then.
+     *
+     * Once, every summary vector is written again. Between 2026-10-04 and
+     * 2026-10-05 a re-embedded summary kept its OLD vector in vec0 (the write
+     * was an INSERT OR REPLACE, which vec0 rejects for an existing key); the
+     * key is present on both sides, so no comparison of keys can see it.
+     *
+     * Throws only with `fromMigration`, and only when a REBUILD or FILL could
+     * be neither done nor recorded — the one outcome that must stop the
+     * migration chain.
+     */
+    private repairVecTables(opts?: { fromMigration?: boolean }): void {
+        // No extension, no vec0 module: a DROP of a virtual table would throw
+        // on every launch. Search is on the JS path there and reads the BLOBs.
+        if (!this.db || !this.resolvedExtPath) return;
+        // The v30 migration calls this, and so does init right after the
+        // migrations: one pass per open, or the launch budget is spent twice.
+        if (this.vecRepairDoneThisOpen) return;
+        const db = this.db;
+        const flag = (key: string): boolean => {
+            try {
+                return (db.prepare('SELECT value FROM app_state WHERE key = ?').get(key) as { value?: string } | undefined)?.value === '1';
+            } catch { return false; /* no app_state yet */ }
+        };
+        const setFlag = (key: string) => {
+            try { db.prepare('INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)').run(key, '1'); } catch { /* asked again next launch */ }
+        };
+        const blockSizeSettled = flag(DatabaseManager.VEC_BLOCK_SHRINK_SETTLED_KEY);
+        const summariesRewritten = flag(DatabaseManager.VEC_SUMMARY_REWRITE_KEY);
+
+        const currentBlock = new RegExp(`chunk_size\\s*=\\s*${DatabaseManager.VEC_CHUNK_SIZE}\\b`);
+        type Candidate = {
+            name: string; dim: number; kind: 'chunks' | 'summaries'; bytes: number;
+            action: 'rebuild' | 'fill' | 'shrink';
+            /** FILL only: the source ids to write. */
+            ids?: number[];
+        };
+        const candidates: Candidate[] = [];
+        const alreadyPending = readPendingVecRebuilds(db);
+        let removedLeftOvers = 0;
+        let blockSizeStillOpen = false;
+        try {
+            // A width that is stored but has no table would otherwise get an
+            // EMPTY one the first time a new vector of that width is stored,
+            // and a native query would then answer from that single row.
+            for (const source of ['chunks', 'chunk_summaries']) {
+                const widths = db.prepare(`SELECT DISTINCT length(embedding) AS bytes FROM ${source} WHERE embedding IS NOT NULL`).all() as { bytes: number }[];
+                for (const { bytes } of widths) {
+                    if (bytes > 0 && bytes % 4 === 0) this.createVecTablesForDim(bytes / 4);
+                }
+            }
+
+            const rows = db.prepare(
+                `SELECT name, sql FROM sqlite_master WHERE type = 'table' AND sql LIKE '%USING vec0%'`
+            ).all() as { name: string; sql: string | null }[];
+            for (const row of rows) {
+                const parsed = parseVecTableName(row.name);
+                if (!parsed || alreadyPending[row.name]) continue;
+                const { kind, dim } = parsed;
+                const ddl = row.sql || '';
+                const source = kind === 'chunks' ? 'chunks' : 'chunk_summaries';
+                const idColumn = kind === 'chunks' ? 'chunk_id' : 'summary_id';
+                // length() of a BLOB is read from the row header, not the BLOB.
+                const storedIds = () => (db.prepare(
+                    `SELECT id FROM ${source} WHERE embedding IS NOT NULL AND length(embedding) = ? ORDER BY id`
+                ).all(dim * 4) as { id: number }[]).map(r => Number(r.id));
+
+                if (!/distance_metric\s*=\s*cosine/i.test(ddl) || !/INTEGER\s+PRIMARY\s+KEY/i.test(ddl)) {
+                    candidates.push({ name: row.name, dim, kind, bytes: storedIds().length * dim * 4, action: 'rebuild' });
+                    continue;
+                }
+                const drift = this.vecTableDrift(db, row.name, kind, dim);
+                if (drift && drift.leftOver.length > 0) {
+                    // On its own: a stray row that will not delete is an
+                    // annoyance, not a reason to skip the rest of the check
+                    // (or, in the migration, to stop the chain).
+                    try {
+                        const remove = db.prepare(`DELETE FROM ${row.name} WHERE ${idColumn} = ?`);
+                        db.transaction(() => { for (const id of drift.leftOver) remove.run(BigInt(id)); })();
+                        removedLeftOvers += drift.leftOver.length;
+                    } catch (e: any) {
+                        console.warn(`[DatabaseManager] Could not remove stray rows from ${row.name}:`, e?.message || e);
+                    }
+                }
+                if (kind === 'summaries' && !summariesRewritten) {
+                    const ids = storedIds();
+                    if (ids.length > 0) {
+                        // A table that also has the old block size is rebuilt:
+                        // the re-insert from the BLOBs rewrites every vector
+                        // anyway, and a FILL would leave it at 1,024-vector
+                        // blocks with the block-size question marked settled.
+                        const alsoShrink = !blockSizeSettled && !currentBlock.test(ddl);
+                        candidates.push({ name: row.name, dim, kind, bytes: ids.length * dim * 4, action: alsoShrink ? 'rebuild' : 'fill', ...(alsoShrink ? {} : { ids }) });
+                        continue;
+                    }
+                } else if (drift && drift.missing.length > 0) {
+                    candidates.push({ name: row.name, dim, kind, bytes: drift.missing.length * dim * 4, action: 'fill', ids: drift.missing });
+                    // Its block size is looked at on a later launch, once it is complete.
+                    if (!blockSizeSettled && !currentBlock.test(ddl)) blockSizeStillOpen = true;
+                    continue;
+                }
+                if (!blockSizeSettled && !currentBlock.test(ddl)) {
+                    candidates.push({ name: row.name, dim, kind, bytes: storedIds().length * dim * 4, action: 'shrink' });
+                }
+            }
+        } catch (e) {
+            console.warn('[DatabaseManager] vec0 table check skipped:', e);
+            if (opts?.fromMigration) throw e;
+            return;
+        }
+        if (removedLeftOvers > 0) console.log(`[DatabaseManager] Removed ${removedLeftOvers} vec0 row(s) whose vectors are no longer stored`);
+
+        // Record tables for the background pass. Throws if the row cannot be
+        // written: then nothing keeps a query off the wrong table. A FILL keeps
+        // its table (recreated: true) and is simply copied over; a REBUILD is
+        // dropped first.
+        const recordPending = (tables: Candidate[]) => {
+            if (tables.length === 0) return;
+            const pending = readPendingVecRebuilds(db);
+            for (const table of tables) pending[table.name] = { recreated: table.action === 'fill', cursor: 0 };
+            writePendingVecRebuilds(db, pending);
+            console.log(`[DatabaseManager] ${tables.map(t => `${t.name} (${(t.bytes / 1024 / 1024).toFixed(0)} MB)`).join(', ')} will be brought up to date after launch; searched from the stored vectors until then`);
+        };
+
+        const budget = DatabaseManager.vecRebuildBudgetBytes;
+        const must = (t: Candidate) => t.action !== 'shrink';
+        candidates.sort((x, y) => Number(must(y)) - Number(must(x)) || x.bytes - y.bytes);
+        const now: Candidate[] = [];
+        const afterLaunch: Candidate[] = [];
+        let waitingForNextLaunch = 0;
+        let spent = 0;
+        for (const table of candidates) {
+            if (spent + table.bytes <= budget) {
+                now.push(table);
+                spent += table.bytes;
+            } else if (must(table)) {
+                afterLaunch.push(table);
+            } else if (table.bytes <= budget) {
+                waitingForNextLaunch++;
+            } else {
+                console.log(`[DatabaseManager] ${table.name} keeps the default vec0 block size (${(table.bytes / 1024 / 1024).toFixed(0)} MB of vectors, complete and densely packed)`);
+            }
+        }
+
+        try {
+            recordPending(afterLaunch);
+        } catch (e) {
+            console.error('[DatabaseManager] Could not record vec0 tables for the background pass:', e);
+            if (opts?.fromMigration) throw e;
+            return;
+        }
+        this.vecRepairDoneThisOpen = true;
+        const settle = () => {
+            if (waitingForNextLaunch === 0 && !blockSizeStillOpen && !blockSizeSettled) setFlag(DatabaseManager.VEC_BLOCK_SHRINK_SETTLED_KEY);
+            if (!summariesRewritten) setFlag(DatabaseManager.VEC_SUMMARY_REWRITE_KEY);
+        };
+        if (now.length === 0) {
+            settle();
+            return;
+        }
+
+        const tableExists = db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`);
+        let rebuilt = 0;
+        let filled = 0;
+        let dropped = false;
+        try {
+            db.transaction(() => {
+                for (const table of now) {
+                    if (table.action === 'fill') {
+                        filled += this.writeVectorsFromBlobs(db, table.name, table.kind, table.dim, table.ids || []);
+                        continue;
+                    }
+                    db.exec(`DROP TABLE IF EXISTS ${table.name};`);
+                    dropped = true;
+                    this.ensuredDims.delete(table.dim);
+                    // createVecTablesForDim logs and swallows a failed CREATE. Here
+                    // that would commit the DROP with nothing in its place.
+                    this.createVecTablesForDim(table.dim);
+                    if (!tableExists.get(table.name)) {
+                        throw new Error(`vec0 table ${table.name} was not recreated`);
+                    }
+                    rebuilt += this.reinsertVectorsFromBlobs(db, table.dim, table.kind);
+                }
+            })();
+            const done = now.filter(t => t.action !== 'fill').map(t => t.name);
+            if (done.length > 0) console.log(`[DatabaseManager] Rebuilt ${done.join(', ')} with cosine distance and ${DatabaseManager.VEC_CHUNK_SIZE}-vector blocks (${rebuilt} vectors re-inserted)`);
+            if (filled > 0) console.log(`[DatabaseManager] Wrote ${filled} stored vector(s) into ${now.filter(t => t.action === 'fill').map(t => t.name).join(', ')}`);
+        } catch (e) {
+            // Rolled back: the old tables are still there. Forget what this
+            // attempt "ensured" so the runtime path re-checks them.
+            this.ensuredDims.clear();
+            console.error('[DatabaseManager] vec0 repair failed (tables kept as they were):', e);
+            // A table that is WRONG must not go on being searched natively
+            // while it waits for the next launch: hand it to the background pass.
+            try {
+                recordPending(now.filter(must));
+            } catch (markErr) {
+                console.error('[DatabaseManager] ...and the tables could not be recorded for a later pass:', markErr);
+                if (opts?.fromMigration) throw e;
+            }
+            return;
+        }
+        settle();
+        if (!dropped) return;
+
+        // The dropped blocks are free pages now; the file only shrinks on VACUUM.
+        // Worth a full rewrite only when it gives back a real share of the file
+        // AND what is left is small enough to copy quickly — on a large database
+        // the pages are simply reused.
+        try {
+            const freePages = Number(db.pragma('freelist_count', { simple: true })) || 0;
+            const pageSize = Number(db.pragma('page_size', { simple: true })) || 4096;
+            const pageCount = Number(db.pragma('page_count', { simple: true })) || 0;
+            const freeBytes = freePages * pageSize;
+            const liveBytes = Math.max(0, pageCount - freePages) * pageSize;
+            if (freeBytes >= 4 * 1024 * 1024 && pageCount > 0 && freePages / pageCount >= 0.25
+                && liveBytes <= DatabaseManager.vecReclaimMaxLiveBytes) {
+                db.exec('VACUUM');
+                db.pragma('wal_checkpoint(TRUNCATE)');
+                console.log(`[DatabaseManager] Reclaimed ${(freeBytes / 1024 / 1024).toFixed(1)} MB after the vec0 rebuild`);
+            }
+        } catch (e) {
+            console.warn('[DatabaseManager] Space reclaim after vec0 rebuild skipped:', e);
+        }
+    }
+
+    /**
+     * Write the stored vectors of the given source ids into a vec0 table that
+     * already exists, replacing the row where there is one. Returns how many
+     * were written. Throws when rows were found and NONE could be written — a
+     * broken write, not bad data — so the caller's transaction rolls back.
+     */
+    private writeVectorsFromBlobs(db: Database.Database, name: string, kind: 'chunks' | 'summaries', dim: number, ids: number[]): number {
+        const source = kind === 'chunks' ? 'chunks' : 'chunk_summaries';
+        const write = prepareVecRowWriter(db, name, kind === 'chunks' ? 'chunk_id' : 'summary_id');
+        let written = 0;
+        let failed = 0;
+        for (let i = 0; i < ids.length; i += 400) {
+            const batch = ids.slice(i, i + 400);
+            const rows = db.prepare(
+                `SELECT id, embedding FROM ${source} WHERE id IN (${batch.map(() => '?').join(',')}) AND embedding IS NOT NULL AND length(embedding) = ?`
+            ).all(...batch, dim * 4) as { id: number; embedding: Buffer }[];
+            for (const row of rows) {
+                try { write(row.id, row.embedding); written++; } catch { failed++; }
+            }
+        }
+        if (failed > 0 && written === 0) throw new Error(`none of ${failed} stored vectors could be written into ${name}`);
+        if (failed > 0) console.warn(`[DatabaseManager] ${name}: ${failed} stored vector(s) could not be written`);
+        return written;
+    }
+
+    private vecRebuildTimer: ReturnType<typeof setTimeout> | null = null;
+    private vecRebuildRunning = false;
+    private vecRepairDoneThisOpen = false;
+
+    /** Start the recorded rebuilds a little after open, if there are any. */
+    private scheduleVecRebuilds(): void {
+        if (!this.db || !this.resolvedExtPath || this.vecRebuildTimer || this.vecRebuildRunning) return;
+        if (Object.keys(readPendingVecRebuilds(this.db)).length === 0) return;
+        this.vecRebuildTimer = setTimeout(() => {
+            this.vecRebuildTimer = null;
+            this.runPendingVecRebuilds().catch(e => {
+                console.error('[DatabaseManager] Background vec0 rebuild failed (continues next launch):', e);
+            });
+        }, DatabaseManager.vecBackgroundRebuildDelayMs);
+        this.vecRebuildTimer.unref?.();
+    }
+
+    private cancelScheduledVecRebuilds(): void {
+        if (this.vecRebuildTimer) {
+            clearTimeout(this.vecRebuildTimer);
+            this.vecRebuildTimer = null;
+        }
+    }
+
+    /**
+     * Rebuild every vec0 table recorded in app_state, one after the other,
+     * without holding the main process: the old table is dropped and the new
+     * one created in one short transaction (29 ms for a 141 MB table,
+     * measured), then filled from the BLOB column a slice at a time with an
+     * event-loop turn between slices. The record keeps a cursor, written in
+     * the same transaction as each slice, so a quit or a crash resumes where
+     * it stopped; it is removed only when the table is complete. Until then
+     * VectorStore does not search the table natively.
+     *
+     * Vectors embedded while this runs are written to the table by the normal
+     * path as well; the copy updates a row that is already there instead of
+     * inserting it again (vec0 has no REPLACE), so the two never collide.
+     * Returns the number of vectors copied. Stops quietly when the database
+     * is closed.
+     */
+    public async runPendingVecRebuilds(): Promise<number> {
+        if (this.vecRebuildRunning || !this.db || !this.resolvedExtPath) return 0;
+        this.vecRebuildRunning = true;
+        const db = this.db;
+        const alive = () => this.db === db && db.open;
+        let copied = 0;
+        try {
+            for (const name of Object.keys(readPendingVecRebuilds(db))) {
+                if (!alive()) break;
+                const parsed = parseVecTableName(name);
+                if (!parsed) continue;
+                // One table that cannot be rebuilt must not hold up the ones
+                // recorded after it. It stays recorded (and so stays on the
+                // stored-vector search path) and is tried again next launch.
+                try {
+                    copied += await this.rebuildVecTableInSlices(db, name, parsed.kind, parsed.dim, alive);
+                } catch (e) {
+                    if (!alive()) break;
+                    console.error(`[DatabaseManager] Background rebuild of ${name} failed (kept recorded, retried next launch):`, e);
+                }
+            }
+        } finally {
+            this.vecRebuildRunning = false;
+        }
+        return copied;
+    }
+
+    private async rebuildVecTableInSlices(
+        db: Database.Database,
+        name: string,
+        kind: 'chunks' | 'summaries',
+        dim: number,
+        alive: () => boolean,
+    ): Promise<number> {
+        const recorded = readPendingVecRebuilds(db)[name];
+        if (!recorded) return 0;
+        const state: PendingVecRebuild = { recreated: recorded.recreated, cursor: recorded.cursor };
+        const save = (next: PendingVecRebuild | null) => {
+            const all = readPendingVecRebuilds(db);
+            if (next) all[name] = next; else delete all[name];
+            writePendingVecRebuilds(db, all);
+        };
+        const nextTurn = () => new Promise<void>(resolve => setImmediate(resolve));
+
+        // Recorded as recreated but not there (the record outlived the table):
+        // start over rather than fail on every launch.
+        if (state.recreated && !db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name)) {
+            state.recreated = false;
+            state.cursor = 0;
+        }
+
+        if (!state.recreated) {
+            while (db.inTransaction) { await nextTurn(); if (!alive()) return 0; }
+            db.transaction(() => {
+                db.exec(`DROP TABLE IF EXISTS ${name};`);
+                this.ensuredDims.delete(dim);
+                this.createVecTablesForDim(dim);
+                if (!db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`).get(name)) {
+                    throw new Error(`vec0 table ${name} was not recreated`);
+                }
+                state.recreated = true;
+                state.cursor = 0;
+                save(state);
+            })();
+        }
+
+        const source = kind === 'chunks' ? 'chunks' : 'chunk_summaries';
+        const idColumn = kind === 'chunks' ? 'chunk_id' : 'summary_id';
+        const bytes = dim * 4;
+        const perSlice = Math.max(16, Math.min(1000, Math.floor(DatabaseManager.VEC_BACKGROUND_SLICE_BYTES / bytes)));
+        const page = db.prepare(
+            `SELECT id, embedding FROM ${source} WHERE id > ? AND embedding IS NOT NULL AND length(embedding) = ? ORDER BY id LIMIT ?`
+        );
+        // Update-or-insert, because this table is live while it is filled: a
+        // chunk embedded meanwhile is written here by the normal path too, and
+        // vec0 rejects a plain second insert for its key (vecRowWrite.ts). A
+        // resumed pass used to count exactly those rows as failures and, when
+        // a slice held nothing else, threw the whole table away to start again.
+        const write = prepareVecRowWriter(db, name, idColumn);
+        let inserted = 0;
+        let failed = 0;
+        for (;;) {
+            if (!alive()) return inserted;
+            if (db.inTransaction) { await nextTurn(); continue; }
+            let read = 0;
+            db.transaction(() => {
+                // .all(), never .iterate(): see reinsertVectorsFromBlobs.
+                const rows = page.all(state.cursor, bytes, perSlice) as { id: number; embedding: Buffer }[];
+                read = rows.length;
+                for (const row of rows) {
+                    try { write(row.id, row.embedding); inserted++; } catch { failed++; }
+                    state.cursor = row.id;
+                }
+                if (read > 0) save(state);
+            })();
+            if (read < perSlice) break;
+            await nextTurn();
+        }
+        if (failed > 0 && inserted === 0) {
+            // Rows existed and none went in: a broken copy, not bad data. Start
+            // over next launch; the table stays recorded, so search stays on
+            // the stored vectors and is still right.
+            save({ recreated: false, cursor: 0 });
+            console.error(`[DatabaseManager] ${name}: none of ${failed} stored vectors could be re-inserted; retried next launch`);
+            return 0;
+        }
+        save(null);
+        console.log(`[DatabaseManager] Rebuilt ${name} in the background (${inserted} vectors${failed > 0 ? `, ${failed} skipped` : ''})`);
+        return inserted;
+    }
+
+    /**
+     * Lazily create a per-dimension vec0 table pair if not already present.
+     * Called by v8 migration and at runtime when a new embedding dimension is first seen.
+     * Uses an in-memory cache to avoid redundant CREATE TABLE IF NOT EXISTS on every insert.
+     */
+    public ensureVecTableForDim(dim: number): void {
+        if (this.ensuredDims.has(dim)) return; // Already verified this session
+        if (!this.db) return;
+        const created = this.createVecTablesForDim(dim);
+        if (created === null) return;
+        this.ensuredDims.add(dim);
+        if (created.length === 0) return;
+        console.log(`[DatabaseManager] Ensured vec0 tables for dim=${dim}`);
+        // A table created NOW that has vectors of its width already stored is
+        // empty where it should not be: a native query would answer from
+        // whatever is stored next and miss everything older. repairVecTables
+        // creates these at launch, so this is the path where it did not run.
+        // Record the table (searched from the stored vectors meanwhile) and
+        // have the background pass copy them in.
+        try {
+            const db = this.db;
+            const stale = created.filter(name => {
+                const source = name.startsWith('vec_chunks_') ? 'chunks' : 'chunk_summaries';
+                return !!db.prepare(`SELECT 1 FROM ${source} WHERE embedding IS NOT NULL AND length(embedding) = ? LIMIT 1`).get(dim * 4);
+            });
+            if (stale.length > 0) {
+                const pending = readPendingVecRebuilds(db);
+                for (const name of stale) pending[name] = { recreated: true, cursor: 0 };
+                writePendingVecRebuilds(db, pending);
+                this.scheduleVecRebuilds();
+            }
+        } catch (e) {
+            console.warn(`[DatabaseManager] Could not check vec0 tables for dim=${dim} against stored vectors:`, e);
+        }
+    }
+
+    /**
+     * CREATE the vec0 table pair for a dimension if either is missing. Returns
+     * the names of the tables it actually created, or null when the dimension
+     * is invalid or a CREATE failed (logged). Nothing else: callers that have
+     * just dropped a table use this, not ensureVecTableForDim.
+     */
+    private createVecTablesForDim(dim: number): string[] | null {
+        if (!this.db) return null;
+        // Guard against SQL injection: dim must be a positive integer
+        if (!Number.isInteger(dim) || dim <= 0 || dim > 100_000) {
+            console.error(`[DatabaseManager] Invalid dimension for vec0 table: ${dim}`);
+            return null;
+        }
+        const exists = this.db.prepare(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?`);
+        const created: string[] = [];
+        try {
+            for (const [name, idColumn] of [[`vec_chunks_${dim}`, 'chunk_id'], [`vec_summaries_${dim}`, 'summary_id']]) {
+                if (exists.get(name)) continue;
+                this.db.exec(`
+                    CREATE VIRTUAL TABLE IF NOT EXISTS ${name} USING vec0(
+                        ${idColumn} INTEGER PRIMARY KEY,
+                        embedding float[${dim}] distance_metric=cosine,
+                        chunk_size=${DatabaseManager.VEC_CHUNK_SIZE}
+                    );
+                `);
+                created.push(name);
+            }
+            return created;
+        } catch (e) {
+            console.error(`[DatabaseManager] Failed to create vec0 tables for dim=${dim}:`, e);
+            return null;
+        }
+    }
+
+    /**
+     * PHASE-2D (Fix-2): drop any orphan legacy vec0 tables from prior
+     * installs that DID create the broken schema, and bump a counter so
+     * the v3/v4 migration blocks can log a single line IF something was
+     * actually cleaned up. The happy path (fresh install from a clean
+     * git clone) drops nothing and emits no log line.
+     *
+     * Also returns the number of tables dropped via `this._lastLegacyCleanup`
+     * so the migration loop can include it in its log message.
+     */
+    private _lastLegacyCleanup: number = 0;
+    private tryProvisionLegacyVecTables(): void {
+        if (!this.db) return;
+        this._lastLegacyCleanup = 0;
+        // The two legacy tables from the broken v3/v4 schema are
+        // `vec_chunks` and `vec_summaries`. They have no dimension
+        // column so sqlite-vec would reject any CREATE that references
+        // them — but they CAN exist as orphans if a prior install DID
+        // create them before the fix landed.
+        const legacyNames = ['vec_chunks', 'vec_summaries'];
+        for (const name of legacyNames) {
+            try {
+                // probe existence with sqlite_master — DROP IF EXISTS is
+                // a no-op when the table is absent, but we want to
+                // distinguish "dropped" from "didn't exist" so the log
+                // is accurate.
+                const row = this.db.prepare(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name = ?"
+                ).get(name);
+                if (!row) continue;
+                this.db.exec(`DROP TABLE ${name};`);
+                this._lastLegacyCleanup++;
+                console.log(`[DatabaseManager] Dropped orphan legacy vec0 table: ${name}`);
+            } catch (_) {
+                // Best-effort: dropping an orphan should never crash
+                // startup. If DROP fails here, the v8/v9 per-dim
+                // migration below will still create the working tables.
+            }
+        }
+    }
+
+    /**
+     * Enumerate every embedding dimension that actually has a vec0 table, unioned
+     * with KNOWN_DIMS. Used by delete/clear paths so they cover dims provisioned
+     * at runtime via ensureVecTableForDim() — not just the static KNOWN_DIMS list.
+     *
+     * Without this, a provider that introduced a dimension outside KNOWN_DIMS (e.g.
+     * a future model at 1024d) would have its rows created on insert but NEVER
+     * deleted, orphaning vec0 rows on re-index/fallback.
+     */
+    public getExistingVecDims(): number[] {
+        const dims = new Set<number>(DatabaseManager.KNOWN_DIMS);
+        if (!this.db) return [...dims];
+        try {
+            const rows = this.db.prepare(
+                `SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_chunks_%'`
+            ).all() as { name: string }[];
+            for (const r of rows) {
+                const m = r.name.match(/^vec_chunks_(\d+)$/);
+                if (m) dims.add(Number(m[1]));
+            }
+        } catch (e) {
+            console.warn('[DatabaseManager] getExistingVecDims failed; falling back to KNOWN_DIMS:', e);
+        }
+        return [...dims];
+    }
+
+    /**
+     * Check if sqlite-vec is available (any per-dimension vec0 table must exist)
+     */
+    public hasVecExtension(): boolean {
+        if (!this.db) return false;
+        try {
+            // Check the most common dimension (Ollama 768); any may suffice
+            this.db.prepare("SELECT count(*) FROM vec_chunks_768 LIMIT 1").get();
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // ============================================
+    // Public API
+    // ============================================
+
+    /**
+     * Expose the raw database instance for external managers (e.g. ProfileDatabaseManager).
+     */
+    public getDb(): Database.Database | null {
+        return this.db;
+    }
+
+    /**
+     * Run `fn` inside a single better-sqlite3 transaction (BEGIN/COMMIT, with
+     * automatic ROLLBACK if `fn` throws). Use this to make a multi-statement
+     * write sequence atomic ACROSS several DatabaseManager methods that each
+     * do their own internal `this.db.transaction(...)` — nested better-sqlite3
+     * transactions are savepoint-based, so an inner method's transaction
+     * commits to the OUTER one, and a throw anywhere rolls the whole thing
+     * back. Without this, e.g. KnowledgePackStore.savePack's four separate
+     * writes (pack/cards/entities/relations) + the source-row write can leave
+     * a half-written, permanently-stuck pack if one fails mid-sequence (the
+     * source's contentHash gate would then skip regeneration forever).
+     */
+    public runInTransaction<T>(fn: () => T): T {
+        if (!this.db) throw new Error('DatabaseManager.runInTransaction: database not initialized');
+        return this.db.transaction(fn)();
+    }
+
+    /** Path to the SQLite database file on disk. Used by worker threads. */
+    public getDbPath(): string {
+        return this.dbPath;
+    }
+
+    /**
+     * Resolved sqlite-vec extension path (without platform file suffix).
+     * Used by worker threads that open their own DB connection.
+     */
+    public getExtPath(): string {
+        return this.resolvedExtPath;
+    }
+
+    /** type, timestamp, question and answer of an AI interaction, as SQLite can bind them (unusable values become NULL). */
+    private static usageColumns(usage: any): [string | null, number | null, string | null, string | null] {
+        const text = (v: unknown): string | null => (typeof v === 'string' ? v || null : typeof v === 'number' ? String(v) : null);
+        const timestamp = typeof usage?.timestamp === 'number' && Number.isFinite(usage.timestamp) ? usage.timestamp : null;
+        return [text(usage?.type), timestamp, text(usage?.question), Array.isArray(usage?.answer) ? null : text(usage?.answer)];
+    }
+
+    public saveMeeting(meeting: Meeting, startTimeMs: number, durationMs: number) {
+        if (!this.db) {
+            console.error('[DatabaseManager] DB not initialized');
+            return;
+        }
+
+        // An UPSERT, not INSERT OR REPLACE (2026-10-04). REPLACE resolves the
+        // conflict by DELETING the existing row, and with foreign_keys ON (since
+        // 2026-07-10) that delete cascades: every re-save of a meeting wiped its
+        // `chunks` and `chunk_summaries`. The normal flow re-saves every meeting
+        // — placeholder at stop, final row once the notes are written — and
+        // search indexing runs in between, so a meeting's chunks were embedded
+        // and then deleted a few seconds later. Found on a live profile: the
+        // queue said "completed", `chunks` held nothing for the meeting, and its
+        // vector sat orphaned in vec_chunks_* (a virtual table, no cascade).
+        // transcripts and ai_interactions are rewritten explicitly below, so
+        // they never needed the cascade. DO UPDATE also keeps the columns this
+        // statement does not list (embedding_provider and the embedding space
+        // stamped at index time), which REPLACE reset to NULL.
+        const insertMeeting = this.db.prepare(`
+            INSERT INTO meetings (id, title, start_time, duration_ms, summary_json, created_at, calendar_event_id, source, is_processed, summary_status, user_titled, calendar_event_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                title = excluded.title,
+                start_time = excluded.start_time,
+                duration_ms = excluded.duration_ms,
+                summary_json = excluded.summary_json,
+                created_at = excluded.created_at,
+                calendar_event_id = excluded.calendar_event_id,
+                source = excluded.source,
+                is_processed = excluded.is_processed,
+                summary_status = excluded.summary_status,
+                user_titled = excluded.user_titled,
+                calendar_event_json = excluded.calendar_event_json
+        `);
+        // RC-7 (2026-08-21): the save rewrites every listed column, so a
+        // user rename made while the row still said "Processing…" (the
+        // placeholder → final-save window can span a slow summary generation)
+        // was clobbered by the final save's generated title AND lost its
+        // user_titled stamp. Pre-read the flag and let the user's title win.
+        const readUserTitle = this.db.prepare(`SELECT title, COALESCE(user_titled, 0) AS user_titled FROM meetings WHERE id = ?`);
+        // The calendar link is pre-read for the same reason: the placeholder,
+        // zero-content and recovery saves carry no metadata, and REPLACE would
+        // otherwise wipe the event a meeting was linked to.
+        const readCalendarLink = this.db.prepare(`SELECT calendar_event_id, calendar_event_json, source FROM meetings WHERE id = ?`);
+
+        const insertTranscript = this.db.prepare(`
+            INSERT INTO transcripts (meeting_id, speaker, content, timestamp_ms, speaker_id, origin)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `);
+
+        const insertInteraction = this.db.prepare(`
+            INSERT INTO ai_interactions (meeting_id, type, timestamp, user_query, ai_response, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `);
+
+        // Idempotency: the meetings row uses INSERT OR REPLACE, but transcripts
+        // and ai_interactions are append-only with autoincrement ids, so a second
+        // saveMeeting() for the same id (the normal flow: stopMeeting writes a
+        // placeholder snapshot, then processAndSaveMeeting writes the final one —
+        // see MeetingPersistence) would APPEND a duplicate copy of every child
+        // row. Recovery re-saves and RAG reprocessing would then read doubled
+        // transcripts. Clearing the existing children inside the same transaction
+        // before re-inserting makes saveMeeting idempotent for a given meeting id.
+        const deleteTranscripts = this.db.prepare(`DELETE FROM transcripts WHERE meeting_id = ?`);
+        const deleteInteractions = this.db.prepare(`DELETE FROM ai_interactions WHERE meeting_id = ?`);
+
+        const summaryJson = JSON.stringify({
+            legacySummary: meeting.summary,
+            detailedSummary: meeting.detailedSummary
+        });
+
+        const runTransaction = this.db.transaction(() => {
+            // 1. Insert Meeting (a user-renamed row keeps its title — RC-7)
+            const existing = readUserTitle.get(meeting.id) as { title: string; user_titled: number } | undefined;
+            const userTitled = existing?.user_titled === 1;
+            // A save that names no event keeps the one already stored.
+            const linked = readCalendarLink.get(meeting.id) as {
+                calendar_event_id: string | null; calendar_event_json: string | null; source: string | null;
+            } | undefined;
+            const keepLink = !meeting.calendarEventId && !!linked?.calendar_event_id;
+            insertMeeting.run(
+                meeting.id,
+                userTitled && existing?.title ? existing.title : meeting.title,
+                startTimeMs,
+                durationMs,
+                summaryJson,
+                meeting.date, // Using the ISO string as created_at for sorting simply
+                keepLink ? linked!.calendar_event_id : (meeting.calendarEventId || null),
+                keepLink ? (linked!.source || 'calendar') : (meeting.source || 'manual'),
+                meeting.isProcessed ? 1 : 0,
+                meeting.summaryStatus || (meeting.isProcessed ? 'completed' : 'queued'),
+                userTitled ? 1 : 0,
+                keepLink
+                    ? linked!.calendar_event_json
+                    : (meeting.calendarEvent ? JSON.stringify(meeting.calendarEvent) : (meeting.calendarEventId && linked?.calendar_event_id === meeting.calendarEventId ? linked.calendar_event_json : null)),
+            );
+
+            // 2. Insert Transcript
+            // Clear any prior child rows for this meeting first so re-saving the
+            // same meeting id (placeholder → final) does not duplicate them.
+            deleteTranscripts.run(meeting.id);
+            if (meeting.transcript) {
+                for (const segment of meeting.transcript) {
+                    insertTranscript.run(
+                        meeting.id,
+                        segment.speaker,
+                        segment.text,
+                        segment.timestamp,
+                        typeof segment.speakerId === 'string' && /^speaker_\d{1,3}$/.test(segment.speakerId) ? segment.speakerId : null,
+                        encodeSavedOrigin(segment)
+                    );
+                }
+            }
+
+            // 3. Insert Interactions
+            deleteInteractions.run(meeting.id);
+            if (meeting.usage) {
+                for (const usage of meeting.usage) {
+                    // items (or a follow-up-questions answer array) and any screenshot
+                    // previews — see usageMetadata.ts for the stored shapes.
+                    const metadata = encodeUsageMetadata(usage);
+
+                    // Only values SQLite can bind (2026-10-15): one answer holding
+                    // an object, a non-finite timestamp or a boolean threw inside
+                    // this transaction and lost the WHOLE meeting's save.
+                    insertInteraction.run(meeting.id, ...DatabaseManager.usageColumns(usage), metadata);
+                }
+            }
+        });
+
+        try {
+            runTransaction();
+            console.log(`[DatabaseManager] Successfully saved meeting ${meeting.id}`);
+        } catch (err) {
+            console.error(`[DatabaseManager] Failed to save meeting ${meeting.id}`, err);
+            throw err;
+        }
+        // Outside the transaction on purpose: a database whose column could not
+        // be added must still save the meeting itself (the user_titled incident
+        // in runMigrations). A processed save clears it; an unprocessed one
+        // writes it when given, else keeps what is there.
+        if (meeting.isProcessed || meeting.recoveryMeta !== undefined) {
+            this.setMeetingRecoveryMeta(meeting.id, meeting.isProcessed ? null : meeting.recoveryMeta);
+        }
+        // Same reasoning: written only when the save carries it, so the final
+        // save after the notes (which does not) keeps what Stop wrote.
+        if (typeof meeting.userNotes === 'string') this.setMeetingUserNotes(meeting.id, meeting.userNotes);
+    }
+
+    // ============================================
+    // The user's notes, earlier versions of the notes, ratings (2026-10-15)
+    // ============================================
+
+    /**
+     * Idempotent, NOT behind user_version (additive; see ensureLiveMeetingSchema).
+     * Both tables cascade from `meetings` (foreign_keys is ON for this
+     * connection), so deleting a meeting or clearing all data takes its
+     * versions and ratings with it.
+     */
+    private ensureMeetingNotesSchema(): void {
+        if (!this.db) return;
+        try { this.db.exec('ALTER TABLE meetings ADD COLUMN user_notes TEXT'); } catch (e) { /* Column already exists */ }
+        try {
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS meeting_notes_versions (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id            TEXT NOT NULL,
+                    created_at            INTEGER NOT NULL,
+                    label                 TEXT NOT NULL,
+                    template_type         TEXT,
+                    mode_id               TEXT,
+                    notes_hash            TEXT NOT NULL,
+                    detailed_summary_json TEXT NOT NULL,
+                    FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_meeting_notes_versions_meeting ON meeting_notes_versions(meeting_id);
+                CREATE TABLE IF NOT EXISTS meeting_notes_ratings (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id  TEXT NOT NULL,
+                    rating      TEXT NOT NULL CHECK (rating IN ('up', 'down')),
+                    comment     TEXT,
+                    notes_hash  TEXT NOT NULL,
+                    mode        TEXT,
+                    provider    TEXT,
+                    model       TEXT,
+                    created_at  INTEGER NOT NULL,
+                    UNIQUE(meeting_id, notes_hash),
+                    FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+            `);
+        } catch (e) {
+            console.error('[DatabaseManager] notes versions / ratings tables could not be created:', e);
+        }
+        // Blind A/B picks between two versions of the notes (services/meeting/notesCompare.ts).
+        try {
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS meeting_notes_comparisons (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    meeting_id  TEXT NOT NULL,
+                    a_hash      TEXT NOT NULL,
+                    b_hash      TEXT NOT NULL,
+                    a_label     TEXT,
+                    b_label     TEXT,
+                    a_provider  TEXT,
+                    a_model     TEXT,
+                    b_provider  TEXT,
+                    b_model     TEXT,
+                    choice      TEXT NOT NULL CHECK (choice IN ('a', 'b', 'same')),
+                    reason      TEXT,
+                    created_at  INTEGER NOT NULL,
+                    FOREIGN KEY(meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_meeting_notes_comparisons_meeting ON meeting_notes_comparisons(meeting_id);
+            `);
+        } catch (e) {
+            console.error('[DatabaseManager] notes comparisons table could not be created:', e);
+        }
+    }
+
+    /** Store one blind A/B pick between two versions of a meeting's notes. */
+    public saveNotesComparison(r: {
+        meetingId: string; aHash: string; bHash: string; aLabel: string; bLabel: string;
+        aProvider: string | null; aModel: string | null; bProvider: string | null; bModel: string | null;
+        choice: 'a' | 'b' | 'same'; reason: string | null; createdAt: number;
+    }): boolean {
+        if (!this.db) return false;
+        if (r.choice !== 'a' && r.choice !== 'b' && r.choice !== 'same') return false;
+        try {
+            return this.db.prepare(`
+                INSERT INTO meeting_notes_comparisons (meeting_id, a_hash, b_hash, a_label, b_label, a_provider, a_model, b_provider, b_model, choice, reason, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `).run(
+                r.meetingId, r.aHash, r.bHash, r.aLabel, r.bLabel, r.aProvider, r.aModel, r.bProvider, r.bModel,
+                r.choice, r.reason?.trim() ? r.reason.trim().slice(0, 2000) : null, r.createdAt,
+            ).changes > 0;
+        } catch (e: any) {
+            console.warn(`[DatabaseManager] the notes comparison was not stored for ${r.meetingId}:`, e?.message);
+            return false;
+        }
+    }
+
+    /** Every blind A/B pick, oldest first. */
+    public listNotesComparisons(): Array<{ meetingId: string; aHash: string; bHash: string; aLabel: string | null; bLabel: string | null; aProvider: string | null; aModel: string | null; bProvider: string | null; bModel: string | null; choice: 'a' | 'b' | 'same'; reason: string | null; createdAt: number }> {
+        if (!this.db) return [];
+        try {
+            return (this.db.prepare('SELECT * FROM meeting_notes_comparisons ORDER BY created_at ASC, id ASC').all() as any[]).map((r) => ({
+                meetingId: r.meeting_id, aHash: r.a_hash, bHash: r.b_hash, aLabel: r.a_label ?? null, bLabel: r.b_label ?? null,
+                aProvider: r.a_provider ?? null, aModel: r.a_model ?? null, bProvider: r.b_provider ?? null, bModel: r.b_model ?? null,
+                choice: r.choice, reason: r.reason ?? null, createdAt: r.created_at,
+            }));
+        } catch {
+            return [];
+        }
+    }
+
+    public setMeetingUserNotes(id: string, text: string | null): boolean {
+        if (!this.db) return false;
+        try {
+            const value = typeof text === 'string' && text.trim() ? text : null;
+            return this.db.prepare('UPDATE meetings SET user_notes = ? WHERE id = ?').run(value, id).changes > 0;
+        } catch (e: any) {
+            console.warn(`[DatabaseManager] the user's notes were not stored for ${id}:`, e?.message);
+            return false;
+        }
+    }
+
+    public getMeetingUserNotes(id: string): string | null {
+        if (!this.db) return null;
+        try {
+            const row = this.db.prepare('SELECT user_notes FROM meetings WHERE id = ?').get(id) as { user_notes: string | null } | undefined;
+            return row?.user_notes ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Keep `detailed` as an earlier version of this meeting's notes, then drop
+     * the oldest beyond MAX_ARCHIVED_NOTES_VERSIONS. Never throws: a version
+     * that could not be kept must not stop the Regenerate that asked for it.
+     */
+    public archiveNotesVersion(meetingId: string, detailed: unknown, now: number = Date.now()): number | null {
+        if (!this.db) return null;
+        try {
+            const { notesVersionLabel, notesContentHash, versionIdsToPrune } = require('../services/meeting/notesVersions') as typeof import('../services/meeting/notesVersions');
+            const mode = (detailed as any)?.mode ?? {};
+            let insertedId: number | null = null;
+            this.db.transaction(() => {
+                const info = this.db!.prepare(`
+                    INSERT INTO meeting_notes_versions (meeting_id, created_at, label, template_type, mode_id, notes_hash, detailed_summary_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                `).run(
+                    meetingId, now, notesVersionLabel(detailed),
+                    typeof mode.selectedTemplateType === 'string' ? mode.selectedTemplateType : null,
+                    typeof mode.selectedModeId === 'string' ? mode.selectedModeId : null,
+                    notesContentHash(detailed), JSON.stringify(detailed),
+                );
+                insertedId = Number(info.lastInsertRowid);
+                const rows = (this.db!.prepare('SELECT id, created_at FROM meeting_notes_versions WHERE meeting_id = ?').all(meetingId) as Array<{ id: number; created_at: number }>)
+                    .map((r) => ({ id: r.id, createdAt: r.created_at }));
+                const drop = this.db!.prepare('DELETE FROM meeting_notes_versions WHERE id = ?');
+                for (const id of versionIdsToPrune(rows)) drop.run(id);
+            })();
+            return insertedId;
+        } catch (e: any) {
+            console.warn(`[DatabaseManager] an earlier version of the notes was not kept for ${meetingId}:`, e?.message);
+            return null;
+        }
+    }
+
+    /** Earlier versions of a meeting's notes, oldest first, each with its notes. */
+    public getNotesVersions(meetingId: string): Array<{ id: number; label: string; createdAt: number; templateType: string | null; detailedSummary: any }> {
+        if (!this.db) return [];
+        try {
+            const rows = this.db.prepare(
+                'SELECT id, label, created_at, template_type, detailed_summary_json FROM meeting_notes_versions WHERE meeting_id = ? ORDER BY created_at ASC, id ASC',
+            ).all(meetingId) as any[];
+            const out: Array<{ id: number; label: string; createdAt: number; templateType: string | null; detailedSummary: any }> = [];
+            for (const r of rows) {
+                try {
+                    out.push({ id: r.id, label: r.label, createdAt: r.created_at, templateType: r.template_type ?? null, detailedSummary: JSON.parse(r.detailed_summary_json) });
+                } catch { /* an unreadable version is left out */ }
+            }
+            return out;
+        } catch {
+            return [];
+        }
+    }
+
+    /** Store (or change) the rating of one version of a meeting's notes. */
+    public saveNotesRating(r: { meetingId: string; rating: 'up' | 'down'; comment?: string | null; notesHash: string; mode?: string | null; provider?: string | null; model?: string | null; createdAt?: number }): boolean {
+        if (!this.db) return false;
+        if (r.rating !== 'up' && r.rating !== 'down') return false;
+        try {
+            const info = this.db.prepare(`
+                INSERT INTO meeting_notes_ratings (meeting_id, rating, comment, notes_hash, mode, provider, model, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(meeting_id, notes_hash) DO UPDATE SET
+                    rating = excluded.rating,
+                    comment = excluded.comment,
+                    mode = excluded.mode,
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    created_at = excluded.created_at
+            `).run(
+                r.meetingId, r.rating, r.comment?.trim() ? r.comment.trim().slice(0, 2000) : null, r.notesHash,
+                r.mode ?? null, r.provider ?? null, r.model ?? null, r.createdAt ?? Date.now(),
+            );
+            return info.changes > 0;
+        } catch (e: any) {
+            console.warn(`[DatabaseManager] the notes rating was not stored for ${r.meetingId}:`, e?.message);
+            return false;
+        }
+    }
+
+    public getNotesRating(meetingId: string, notesHash: string): { rating: 'up' | 'down'; comment: string | null; createdAt: number } | null {
+        if (!this.db) return null;
+        try {
+            const row = this.db.prepare('SELECT rating, comment, created_at FROM meeting_notes_ratings WHERE meeting_id = ? AND notes_hash = ?').get(meetingId, notesHash) as any;
+            return row ? { rating: row.rating, comment: row.comment ?? null, createdAt: row.created_at } : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** Every rating, oldest first (the offline export reads these). */
+    public listNotesRatings(): Array<{ meetingId: string; rating: 'up' | 'down'; comment: string | null; notesHash: string; mode: string | null; provider: string | null; model: string | null; createdAt: number }> {
+        if (!this.db) return [];
+        try {
+            return (this.db.prepare('SELECT * FROM meeting_notes_ratings ORDER BY created_at ASC, id ASC').all() as any[]).map((r) => ({
+                meetingId: r.meeting_id, rating: r.rating, comment: r.comment ?? null, notesHash: r.notes_hash,
+                mode: r.mode ?? null, provider: r.provider ?? null, model: r.model ?? null, createdAt: r.created_at,
+            }));
+        } catch {
+            return [];
+        }
+    }
+
+    // ============================================
+    // Live meetings (2026-10-15): the running meeting's transcript on disk
+    // ============================================
+    //
+    // services/meeting/LiveMeetingJournal.ts writes the transcript of the meeting
+    // in progress here as it grows, so a quit, crash or OS shutdown mid-meeting
+    // no longer loses it. Its own table, not `meetings`: a meeting in progress
+    // must not be listed, searched, exported or indexed. The next launch turns a
+    // left-over row into an unprocessed meeting (promoteLiveMeeting) and the
+    // usual recovery writes its notes.
+
+    /**
+     * The table and the meetings column, created idempotently and NOT behind
+     * user_version: both are additive, and parallel branches race the version
+     * counter (see the user_titled note in runMigrations).
+     */
+    private ensureLiveMeetingSchema(): void {
+        if (!this.db) return;
+        try {
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS live_meeting_journal (
+                    id              TEXT PRIMARY KEY,
+                    started_at      INTEGER NOT NULL,
+                    updated_at      INTEGER NOT NULL,
+                    transcript_json TEXT NOT NULL,
+                    usage_json      TEXT NOT NULL DEFAULT '[]',
+                    meta_json       TEXT NOT NULL DEFAULT '{}'
+                );
+            `);
+        } catch (e) {
+            console.error('[DatabaseManager] live_meeting_journal could not be created (meetings in progress will not survive a quit):', e);
+        }
+        try { this.db.exec('ALTER TABLE meetings ADD COLUMN recovery_meta_json TEXT'); } catch (e) { /* Column already exists */ }
+        // AI interactions of a running meeting past what memory keeps (see
+        // appendLiveUsageOverflow). rowid is the order they happened in.
+        try {
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS live_meeting_usage_overflow (
+                    meeting_id TEXT NOT NULL,
+                    usage_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_live_usage_overflow_meeting ON live_meeting_usage_overflow(meeting_id);
+            `);
+        } catch (e) {
+            console.error('[DatabaseManager] live_meeting_usage_overflow could not be created (a meeting past 1,500 AI answers keeps only the newest):', e);
+        }
+    }
+
+    /**
+     * AI interactions of a running meeting that left memory (SessionTracker
+     * keeps the newest 1,500; the journal row holds those), oldest first, one
+     * row each, written once. Read back at Stop and with the meeting's live row.
+     */
+    public appendLiveUsageOverflow(id: string, entries: unknown[]): void {
+        if (!this.db || entries.length === 0) return;
+        const insert = this.db.prepare('INSERT INTO live_meeting_usage_overflow (meeting_id, usage_json) VALUES (?, ?)');
+        this.db.transaction(() => { for (const e of entries) insert.run(id, JSON.stringify(e ?? null)); })();
+    }
+
+    public getLiveUsageOverflow(id: string): any[] {
+        if (!this.db) return [];
+        try {
+            const rows = this.db.prepare('SELECT usage_json FROM live_meeting_usage_overflow WHERE meeting_id = ? ORDER BY rowid ASC').all(id) as Array<{ usage_json: string }>;
+            const out: any[] = [];
+            for (const r of rows) { try { const v = JSON.parse(r.usage_json); if (v && typeof v === 'object') out.push(v); } catch { /* skip one bad row */ } }
+            return out;
+        } catch {
+            return [];
+        }
+    }
+
+    public removeLiveUsageOverflow(id: string): void {
+        if (!this.db) return;
+        try { this.db.prepare('DELETE FROM live_meeting_usage_overflow WHERE meeting_id = ?').run(id); } catch { /* table may not exist */ }
+    }
+
+    /** Overflow rows whose meeting has no live row any more (and is not `runningId`). */
+    public sweepOrphanUsageOverflow(runningId: string | null): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare('DELETE FROM live_meeting_usage_overflow WHERE meeting_id NOT IN (SELECT id FROM live_meeting_journal) AND meeting_id IS NOT ?').run(runningId);
+        } catch { /* table may not exist */ }
+    }
+
+    /** Upsert the running meeting's row. Synchronous; throws on failure (the journal retries). */
+    public writeLiveMeeting(row: { id: string; startedAt: number; updatedAt: number; transcript: unknown[]; usage: unknown[]; meta: unknown }): void {
+        if (!this.db) throw new Error('database unavailable');
+        this.db.prepare(`
+            INSERT INTO live_meeting_journal (id, started_at, updated_at, transcript_json, usage_json, meta_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                transcript_json = excluded.transcript_json,
+                usage_json = excluded.usage_json,
+                meta_json = excluded.meta_json
+        `).run(row.id, row.startedAt, row.updatedAt, JSON.stringify(row.transcript ?? []), JSON.stringify(row.usage ?? []), JSON.stringify(row.meta ?? {}));
+    }
+
+    public removeLiveMeeting(id: string): void {
+        if (!this.db) return;
+        this.db.prepare('DELETE FROM live_meeting_journal WHERE id = ?').run(id);
+        try { this.db.prepare('DELETE FROM live_meeting_usage_overflow WHERE meeting_id = ?').run(id); } catch { /* table may not exist */ }
+    }
+
+    /** Every left-over live meeting, oldest first. A malformed row is dropped from the list, not thrown. */
+    public getLiveMeetings(): Array<{ id: string; startedAt: number; updatedAt: number; transcript: any[]; usage: any[]; meta: any }> {
+        if (!this.db) return [];
+        let rows: any[] = [];
+        try {
+            rows = this.db.prepare('SELECT * FROM live_meeting_journal ORDER BY started_at ASC').all() as any[];
+        } catch {
+            return [];
+        }
+        const out: Array<{ id: string; startedAt: number; updatedAt: number; transcript: any[]; usage: any[]; meta: any }> = [];
+        for (const row of rows) {
+            try {
+                const transcript = JSON.parse(row.transcript_json || '[]');
+                const usage = JSON.parse(row.usage_json || '[]');
+                const meta = JSON.parse(row.meta_json || '{}');
+                if (!Array.isArray(transcript)) continue;
+                const kept = Array.isArray(usage) ? usage : [];
+                const overflow = this.getLiveUsageOverflow(row.id);
+                out.push({ id: row.id, startedAt: row.started_at, updatedAt: row.updated_at, transcript, usage: overflow.length ? [...overflow, ...kept] : kept, meta: meta && typeof meta === 'object' ? meta : {} });
+            } catch {
+                console.warn(`[DatabaseManager] live meeting ${row?.id} is unreadable; left in place`);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * A left-over live meeting becomes an unprocessed meeting, in one
+     * transaction: saved as `meeting` (a placeholder) with its recovery
+     * metadata, and its live row deleted. A meeting already saved under the id
+     * (Stop got that far before the app went) is kept as it is; only the live
+     * row goes. Returns whether a meeting was created.
+     */
+    public promoteLiveMeeting(meeting: Meeting, startTimeMs: number, durationMs: number): boolean {
+        if (!this.db) return false;
+        const exists = this.db.prepare('SELECT 1 FROM meetings WHERE id = ?');
+        let created = false;
+        this.db.transaction(() => {
+            if (!exists.get(meeting.id)) {
+                this.saveMeeting(meeting, startTimeMs, durationMs);
+                created = true;
+            }
+            this.db!.prepare('DELETE FROM live_meeting_journal WHERE id = ?').run(meeting.id);
+            try { this.db!.prepare('DELETE FROM live_meeting_usage_overflow WHERE meeting_id = ?').run(meeting.id); } catch { /* table may not exist */ }
+        })();
+        return created;
+    }
+
+    public setMeetingRecoveryMeta(id: string, meta: unknown): void {
+        if (!this.db) return;
+        try {
+            this.db.prepare('UPDATE meetings SET recovery_meta_json = ? WHERE id = ?').run(meta === null || meta === undefined ? null : JSON.stringify(meta), id);
+        } catch (e: any) {
+            console.warn(`[DatabaseManager] recovery metadata not stored for ${id}:`, e?.message);
+        }
+    }
+
+    public getMeetingRecoveryMeta(id: string): any | null {
+        if (!this.db) return null;
+        try {
+            const row = this.db.prepare('SELECT recovery_meta_json FROM meetings WHERE id = ?').get(id) as { recovery_meta_json: string | null } | undefined;
+            if (!row?.recovery_meta_json) return null;
+            const value = JSON.parse(row.recovery_meta_json);
+            return value && typeof value === 'object' ? value : null;
+        } catch {
+            return null;
+        }
+    }
+
+    public updateMeetingTitle(id: string, title: string): boolean {
+        if (!this.db) return false;
+        try {
+            // RC-7: a rename is the USER's title. Stamp user_titled so the
+            // generated-title writers (saveMeeting's final write, the deferred
+            // replaceDetailedSummary) yield to it from now on.
+            const stmt = this.db.prepare('UPDATE meetings SET title = ?, user_titled = 1 WHERE id = ?');
+            const info = stmt.run(title, id);
+            return info.changes > 0;
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to update title for meeting ${id}:`, error);
+            return false;
+        }
+    }
+
+    public updateSummaryStatus(id: string, status: SummaryStatus): boolean {
+        if (!this.db) return false;
+        try {
+            const allowed = new Set(['queued', 'chunking', 'summarizing_chunks', 'reducing', 'validating', 'completed', 'failed']);
+            if (!allowed.has(status)) return false;
+            const info = this.db.prepare('UPDATE meetings SET summary_status = ? WHERE id = ?').run(status, id);
+            return info.changes > 0;
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to update summary status for meeting ${id}:`, error);
+            return false;
+        }
+    }
+
+    /**
+     * Terminal state for a post-meeting summary that threw before saveMeeting could run.
+     *
+     * On that path the placeholder row endMeeting wrote is never rewritten — saveMeeting
+     * is never reached — so the meeting kept title "Processing..." and legacySummary
+     * "Generating summary..." forever while its status said 'failed'. The stale blurb is
+     * not cosmetic: it is what pdfGenerator prints into an exported PDF, what
+     * searchGlobalMeetings offers as a result snippet, and what RAGManager indexes as the
+     * meeting's summary when no overview exists.
+     *
+     * `is_processed` is deliberately left alone — 0 is exactly what getUnprocessedMeetings
+     * and recoverUnprocessedMeetings key on to retry this meeting at the next app start,
+     * and that retry is the reason a hard failure is not permanent.
+     *
+     * A manual rename still wins, via the same user_titled guard replaceDetailedSummary
+     * uses; and because this is NOT updateMeetingTitle, the fallback name written here is
+     * not stamped as the user's, so a later successful run replaces it freely.
+     */
+    public markSummaryGenerationFailed(id: string, fallbackTitle: string): boolean {
+        if (!this.db) return false;
+        try {
+            const row = this.db.prepare('SELECT summary_json FROM meetings WHERE id = ?').get(id) as any;
+            if (!row) return false;
+            // An unreadable blob is left exactly as it is: the status and title still have
+            // to land, and rewriting JSON we could not parse would destroy more than it fixes.
+            let jsonStr: string | null = null;
+            try {
+                const existingData = JSON.parse(row.summary_json || '{}') || {};
+                if (existingData.legacySummary) jsonStr = JSON.stringify({ ...existingData, legacySummary: '' });
+            } catch { /* leave summary_json untouched */ }
+
+            const titleClause = 'title = CASE WHEN COALESCE(user_titled, 0) = 1 THEN title ELSE ? END';
+            const info = jsonStr === null
+                ? this.db.prepare(`UPDATE meetings SET summary_status = 'failed', ${titleClause} WHERE id = ?`)
+                    .run(fallbackTitle, id)
+                : this.db.prepare(`UPDATE meetings SET summary_json = ?, summary_status = 'failed', ${titleClause} WHERE id = ?`)
+                    .run(jsonStr, fallbackTitle, id);
+            return info.changes > 0;
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to mark summary generation failed for meeting ${id}:`, error);
+            return false;
+        }
+    }
+
+    public getMeetingsWithSummaryStatus(status: SummaryStatus): Array<{ id: string; title: string; summaryStatus: SummaryStatus; date: string }> {
+        if (!this.db) return [];
+        try {
+            const rows = this.db.prepare('SELECT id, title, created_at, summary_status FROM meetings WHERE summary_status = ? ORDER BY created_at DESC').all(status) as Array<{ id: string; title: string; created_at: string; summary_status: SummaryStatus }>;
+            return rows.map(row => ({ id: row.id, title: row.title, date: row.created_at, summaryStatus: row.summary_status }));
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to get meetings with summary status ${status}:`, error);
+            return [];
+        }
+    }
+
+    /**
+     * Title + date for the given meeting ids, nothing else — the Launcher's memory
+     * search links a recalled memory to its meeting on every (debounced) keystroke, so
+     * it must not load summaries or transcripts. Ids match case-insensitively: Hindsight
+     * tags carry them lowercased. Unknown ids are simply absent from the result.
+     */
+    public getMeetingHeadlines(ids: string[]): Array<{ id: string; title: string; date: string }> {
+        if (!this.db || ids.length === 0) return [];
+        try {
+            const wanted = [...new Set(ids.map((id) => String(id).toLowerCase()))].slice(0, 50);
+            const rows = this.db.prepare(`SELECT id, title, created_at FROM meetings WHERE lower(id) IN (${wanted.map(() => '?').join(', ')})`).all(...wanted) as Array<{ id: string; title: string; created_at: string }>;
+            return rows.map((row) => ({ id: row.id, title: row.title, date: row.created_at }));
+        } catch (error) {
+            console.error('[DatabaseManager] Failed to get meeting headlines:', error);
+            return [];
+        }
+    }
+
+    public updateMeetingSummary(id: string, updates: { overview?: string, actionItems?: string[], keyPoints?: string[], actionItemsTitle?: string, keyPointsTitle?: string }): boolean {
+        if (!this.db) return false;
+
+        try {
+            // 1. Get current summary_json
+            const row = this.db.prepare('SELECT summary_json FROM meetings WHERE id = ?').get(id) as any;
+            if (!row) return false;
+
+            const existingData = JSON.parse(row.summary_json || '{}');
+            const currentDetailed = existingData.detailedSummary || {};
+
+            // 2. Merge updates. userEditedAt marks notes the user changed by
+            // hand: Regenerate asks before replacing them (notesVersions.ts).
+            const newDetailed = {
+                ...currentDetailed,
+                ...updates,
+                userEditedAt: Date.now(),
+            };
+
+            // Should likely filter out undefined updates if spread doesn't handle them how we want,
+            // but spread over undefined is fine. We want to overwrite if provided.
+            // If updates.overview is empty string, it overwrites.
+            // If updates.overview is undefined, we use ...updates trick:
+            // Actually spread only includes own enumerable properties. If I pass { overview: "new" }, it works.
+
+            // However, we need to be careful not to wipe legacySummary if it exists
+            const newData = {
+                ...existingData,
+                detailedSummary: newDetailed
+            };
+
+            const jsonStr = JSON.stringify(newData);
+
+            // 3. Write back
+            const stmt = this.db.prepare('UPDATE meetings SET summary_json = ? WHERE id = ?');
+            const info = stmt.run(jsonStr, id);
+            return info.changes > 0;
+
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to update summary for meeting ${id}:`, error);
+            return false;
+        }
+    }
+
+    /**
+     * Replace the entire detailedSummary blob (used by regenerate-notes). Preserves any
+     * sibling keys in summary_json (e.g. legacy fields). Also updates the title column when
+     * the new summary carries one. summary_status is set to the provided value.
+     */
+    /** Meetings whose saved notes contain `text` (id + raw summary_json), for
+     *  deterministic data migrations such as calendarNameMigration. */
+    public listMeetingSummariesMentioning(text: string): Array<{ id: string; summaryJson: string }> {
+        if (!this.db || !text) return [];
+        try {
+            const rows = this.db.prepare("SELECT id, summary_json FROM meetings WHERE instr(summary_json, ?) > 0").all(text) as Array<{ id: string; summary_json: string }>;
+            return rows.map((r) => ({ id: r.id, summaryJson: r.summary_json || '{}' }));
+        } catch (error) {
+            console.error('[DatabaseManager] listMeetingSummariesMentioning failed:', error);
+            return [];
+        }
+    }
+
+    public replaceDetailedSummary(id: string, detailedSummary: Meeting['detailedSummary'], opts?: { title?: string; summaryStatus?: SummaryStatus }): boolean {
+        if (!this.db) return false;
+        try {
+            const row = this.db.prepare('SELECT summary_json FROM meetings WHERE id = ?').get(id) as any;
+            if (!row) return false;
+            const existingData = JSON.parse(row.summary_json || '{}');
+            const newData = { ...existingData, detailedSummary };
+            const jsonStr = JSON.stringify(newData);
+            if (opts?.title && opts?.summaryStatus) {
+                // RC-7 (2026-08-21): the deferred V3 summary used to overwrite
+                // the title UNCONDITIONALLY — a user rename made even after the
+                // meeting ended was silently reverted whenever the detailed
+                // summary landed. A generated title never beats a user one.
+                const info = this.db.prepare(
+                    'UPDATE meetings SET summary_json = ?, title = CASE WHEN COALESCE(user_titled, 0) = 1 THEN title ELSE ? END, summary_status = ? WHERE id = ?',
+                ).run(jsonStr, opts.title, opts.summaryStatus, id);
+                return info.changes > 0;
+            }
+            if (opts?.summaryStatus) {
+                const info = this.db.prepare('UPDATE meetings SET summary_json = ?, summary_status = ? WHERE id = ?').run(jsonStr, opts.summaryStatus, id);
+                return info.changes > 0;
+            }
+            const info = this.db.prepare('UPDATE meetings SET summary_json = ? WHERE id = ?').run(jsonStr, id);
+            return info.changes > 0;
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to replace detailed summary for meeting ${id}:`, error);
+            return false;
+        }
+    }
+
+    /**
+     * Persist the per-meeting speaker rename map into detailedSummary.speakerLabels.
+     * Never touches transcript rows. Other summary fields change only through
+     * `rewriteNotes`, which gets the stored detailed summary (with its PREVIOUS
+     * labels still on it) and returns the one to save — so the rename and the
+     * notes that carry it land in the same write.
+     */
+    /**
+     * Link a meeting to a calendar event, or unlink it (`snapshot` null): the
+     * meeting notes' "which event was this" choice. Its own UPDATE, because
+     * saveMeeting keeps an existing link when a save names none, so "not a
+     * calendar meeting" could never be recorded through it. Takes the event's
+     * title too, unless the user renamed the meeting.
+     */
+    public setMeetingCalendarEvent(id: string, snapshot: NonNullable<Meeting['calendarEvent']> | null): boolean {
+        if (!this.db) return false;
+        try {
+            const info = snapshot
+                ? this.db.prepare(
+                    `UPDATE meetings SET calendar_event_id = ?, calendar_event_json = ?, source = 'calendar',
+                        title = CASE WHEN COALESCE(user_titled, 0) = 1 THEN title ELSE ? END WHERE id = ?`,
+                ).run(snapshot.id, JSON.stringify(snapshot), snapshot.title, id)
+                : this.db.prepare(
+                    `UPDATE meetings SET calendar_event_id = NULL, calendar_event_json = NULL, source = 'manual' WHERE id = ?`,
+                ).run(id);
+            return info.changes > 0;
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to set the calendar event for meeting ${id}:`, error);
+            return false;
+        }
+    }
+
+    /** When a meeting started and how long it ran, in ms; null for no such meeting. */
+    public getMeetingTimes(id: string): { startMs: number; durationMs: number } | null {
+        if (!this.db) return null;
+        try {
+            const row = this.db.prepare('SELECT start_time, duration_ms FROM meetings WHERE id = ?').get(id) as { start_time: number; duration_ms: number } | undefined;
+            return row ? { startMs: Number(row.start_time) || 0, durationMs: Number(row.duration_ms) || 0 } : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** The snapshot kept by the most recent meeting linked to this event, if any. */
+    public getCalendarEventSnapshot(eventId: string): Meeting['calendarEvent'] {
+        if (!this.db || !eventId) return undefined;
+        try {
+            const row = this.db.prepare(
+                `SELECT calendar_event_json FROM meetings WHERE calendar_event_id = ? AND calendar_event_json IS NOT NULL ORDER BY start_time DESC LIMIT 1`,
+            ).get(eventId) as { calendar_event_json: string } | undefined;
+            return parseCalendarEvent(row?.calendar_event_json);
+        } catch {
+            return undefined;
+        }
+    }
+
+    /**
+     * Saved meetings linked to a calendar event that started at or after
+     * `sinceMs`, newest first, with their notes: what the "last time" lookup
+     * for a recurring meeting reads (services/meeting/recurringMeetings.ts).
+     * Read-only; no schema change (calendar_event_json already exists).
+     */
+    public getCalendarLinkedMeetingsSince(sinceMs: number, limit: number = 200): Array<{
+        id: string; title: string; startMs: number; calendarEventId: string | null;
+        calendarEvent: Meeting['calendarEvent']; detailedSummary: any; summaryStatus: string | null; isProcessed: boolean;
+    }> {
+        if (!this.db) return [];
+        try {
+            const rows = this.db.prepare(
+                `SELECT id, title, start_time, calendar_event_id, calendar_event_json, summary_json, summary_status, is_processed
+                 FROM meetings
+                 WHERE calendar_event_id IS NOT NULL AND start_time >= ?
+                 ORDER BY start_time DESC LIMIT ?`,
+            ).all(Number.isFinite(sinceMs) ? sinceMs : 0, Math.max(1, Math.min(limit, 1000))) as any[];
+            return rows.map((row) => {
+                let detailedSummary: any = null;
+                try { detailedSummary = JSON.parse(row.summary_json || '{}')?.detailedSummary ?? null; } catch { /* unreadable notes: no recap */ }
+                return {
+                    id: row.id,
+                    title: row.title,
+                    startMs: Number(row.start_time) || 0,
+                    calendarEventId: row.calendar_event_id ?? null,
+                    calendarEvent: parseCalendarEvent(row.calendar_event_json),
+                    detailedSummary,
+                    summaryStatus: row.summary_status ?? null,
+                    isProcessed: row.is_processed === 1 || row.is_processed === true,
+                };
+            });
+        } catch (error) {
+            console.error('[DatabaseManager] getCalendarLinkedMeetingsSince failed:', error);
+            return [];
+        }
+    }
+
+    /**
+     * Saved meetings that started at or after `sinceMs`, newest first, with
+     * their notes, length and calendar snapshot (linked or not): what the
+     * assist features read (services/assist: "You owe", the pre-meeting
+     * brief, the catch-up after back-to-back meetings). Read-only; no schema
+     * change.
+     */
+    public getMeetingsWithNotesSince(sinceMs: number, limit: number = 300): Array<{
+        id: string; title: string; startMs: number; durationMs: number; calendarEventId: string | null;
+        calendarEvent: Meeting['calendarEvent']; detailedSummary: any; summaryStatus: string | null; isProcessed: boolean;
+    }> {
+        if (!this.db) return [];
+        try {
+            const rows = this.db.prepare(
+                `SELECT id, title, start_time, duration_ms, calendar_event_id, calendar_event_json, summary_json, summary_status, is_processed
+                 FROM meetings
+                 WHERE start_time >= ?
+                 ORDER BY start_time DESC LIMIT ?`,
+            ).all(Number.isFinite(sinceMs) ? sinceMs : 0, Math.max(1, Math.min(limit, 1000))) as any[];
+            return rows.map((row) => {
+                let detailedSummary: any = null;
+                try { detailedSummary = JSON.parse(row.summary_json || '{}')?.detailedSummary ?? null; } catch { /* unreadable notes: nothing to read */ }
+                return {
+                    id: row.id,
+                    title: row.title,
+                    startMs: Number(row.start_time) || 0,
+                    durationMs: Number(row.duration_ms) || 0,
+                    calendarEventId: row.calendar_event_id ?? null,
+                    calendarEvent: parseCalendarEvent(row.calendar_event_json),
+                    detailedSummary,
+                    summaryStatus: row.summary_status ?? null,
+                    isProcessed: row.is_processed === 1 || row.is_processed === true,
+                };
+            });
+        } catch (error) {
+            console.error('[DatabaseManager] getMeetingsWithNotesSince failed:', error);
+            return [];
+        }
+    }
+
+    public updateSpeakerLabels(
+        id: string,
+        speakerLabels: Record<string, string>,
+        rewriteNotes?: (detailed: any) => any,
+    ): boolean {
+        if (!this.db) return false;
+        try {
+            const row = this.db.prepare('SELECT summary_json FROM meetings WHERE id = ?').get(id) as any;
+            if (!row) return false;
+            const existingData = JSON.parse(row.summary_json || '{}');
+            // Preserve whatever detailedSummary shape exists (V3, legacy, or none). When it is
+            // absent we attach labels to a minimal object WITHOUT inventing empty
+            // actionItems/keyPoints arrays that the renderer would treat as "processed but
+            // empty" — labels alone is a safe additive blob a later summarize will merge into.
+            let currentDetailed = existingData.detailedSummary;
+            if (rewriteNotes && currentDetailed && typeof currentDetailed === 'object') {
+                try { currentDetailed = rewriteNotes(currentDetailed) ?? currentDetailed; }
+                catch (e) { console.warn(`[DatabaseManager] speaker rename not applied to notes for ${id}:`, e); }
+            }
+            const newDetailed = currentDetailed && typeof currentDetailed === 'object'
+                ? { ...currentDetailed, speakerLabels }
+                : { speakerLabels };
+            const newData = { ...existingData, detailedSummary: newDetailed };
+            const info = this.db.prepare('UPDATE meetings SET summary_json = ? WHERE id = ?').run(JSON.stringify(newData), id);
+            return info.changes > 0;
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to update speaker labels for meeting ${id}:`, error);
+            return false;
+        }
+    }
+
+    /**
+     * Transcript lines that contain any of `terms` (case-insensitive substring),
+     * across every saved meeting. Backs "Search past meetings", which used to
+     * search titles and summaries only — never what was actually said — and so
+     * could never "jump to the moment". LIKE wildcards in a term are escaped, so
+     * a search for "50%" matches the text "50%" and not every line.
+     */
+    public searchTranscriptLines(terms: string[], limit: number = 2000): Array<{ meetingId: string; speaker: string; content: string; timestampMs: number }> {
+        if (!this.db) return [];
+        const clean = terms.map((t) => String(t || '').toLowerCase().trim()).filter((t) => t.length > 1).slice(0, 8);
+        if (clean.length === 0) return [];
+        const escapeLike = (t: string) => t.replace(/[\\%_]/g, (c) => `\\${c}`);
+        const where = clean.map(() => `lower(content) LIKE ? ESCAPE '\\'`).join(' OR ');
+        try {
+            return this.db.prepare(
+                `SELECT meeting_id AS meetingId, speaker, content, timestamp_ms AS timestampMs FROM transcripts WHERE ${where} LIMIT ?`,
+            ).all(...clean.map((t) => `%${escapeLike(t)}%`), Math.max(1, Math.min(limit, 10_000))) as any[];
+        } catch (error) {
+            console.error('[DatabaseManager] searchTranscriptLines failed:', error);
+            return [];
+        }
+    }
+
+    public getRecentMeetings(limit: number = 50): Meeting[] {
+        if (!this.db) return [];
+
+        const stmt = this.db.prepare(`
+            SELECT * FROM meetings
+            ORDER BY created_at DESC
+            LIMIT ?
+        `);
+
+        const rows = stmt.all(limit) as any[];
+
+        return rows.map(row => {
+            const summaryData = JSON.parse(row.summary_json || '{}');
+
+            // Format duration string if needed, but we typically store ms
+            // Let's recreate the 'duration' string "MM:SS" from duration_ms
+            const minutes = Math.floor(row.duration_ms / 60000);
+            const seconds = Math.floor((row.duration_ms % 60000) / 1000);
+            const durationStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+
+            return {
+                id: row.id,
+                title: row.title,
+                date: row.created_at, // Use the stored ISO string
+                duration: durationStr,
+                summary: summaryData.legacySummary || '',
+                detailedSummary: summaryData.detailedSummary,
+                calendarEventId: row.calendar_event_id,
+                source: row.source as any,
+                summaryStatus: row.summary_status as SummaryStatus | undefined,
+                // We don't load full transcript/usage for list view to keep it light
+                transcript: [] as any[],
+                usage: [] as any[]
+            };
+        });
+    }
+
+    public getMeetingDetails(id: string): Meeting | null {
+        if (!this.db) return null;
+
+        const meetingStmt = this.db.prepare('SELECT * FROM meetings WHERE id = ?');
+        const meetingRow = meetingStmt.get(id) as any;
+
+        if (!meetingRow) return null;
+
+        // Get Transcript
+        const transcriptStmt = this.db.prepare('SELECT * FROM transcripts WHERE meeting_id = ? ORDER BY timestamp_ms ASC');
+        const transcriptRows = transcriptStmt.all(id) as any[];
+
+        // Get Usage
+        const usageStmt = this.db.prepare('SELECT * FROM ai_interactions WHERE meeting_id = ? ORDER BY timestamp ASC');
+        const usageRows = usageStmt.all(id) as any[];
+
+        // Reconstruct
+        const summaryData = JSON.parse(meetingRow.summary_json || '{}');
+        const minutes = Math.floor(meetingRow.duration_ms / 60000);
+        const seconds = Math.floor((meetingRow.duration_ms % 60000) / 1000);
+        const durationStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+
+        const transcript = transcriptRows.map(row => ({
+            speaker: row.speaker,
+            text: row.content,
+            timestamp: row.timestamp_ms,
+            ...(row.speaker_id ? { speakerId: row.speaker_id as string } : {}),
+            ...decodeSavedOrigin(row.origin),
+        }));
+
+        const usage = usageRows.map(row => {
+            // For 'followup_questions' the answer is usually null and `items` holds the questions.
+            const { items, images } = decodeUsageMetadata(row.metadata_json);
+            return {
+                type: row.type,
+                timestamp: row.timestamp,
+                question: row.user_query,
+                answer: row.ai_response,
+                items,
+                // Previews of the screenshots the answer used (usagePreviews.ts).
+                ...(images ? { images } : {}),
+            };
+        });
+
+        return {
+            id: meetingRow.id,
+            title: meetingRow.title,
+            date: meetingRow.created_at,
+            duration: durationStr,
+            summary: summaryData.legacySummary || '',
+            detailedSummary: summaryData.detailedSummary,
+            calendarEventId: meetingRow.calendar_event_id,
+            calendarEvent: parseCalendarEvent(meetingRow.calendar_event_json),
+            source: meetingRow.source,
+            summaryStatus: meetingRow.summary_status as SummaryStatus | undefined,
+            transcript: transcript,
+            usage: usage,
+            ...(typeof meetingRow.user_notes === 'string' && meetingRow.user_notes ? { userNotes: meetingRow.user_notes } : {}),
+        };
+    }
+
+    public deleteMeeting(id: string): boolean {
+        if (!this.db) return false;
+
+        try {
+            // F-705: reap the vec0 rows FIRST. `vec_chunks_*`/`vec_summaries_*`
+            // are USING vec0 VIRTUAL tables, and SQLite virtual tables carry no
+            // foreign keys — an ON DELETE CASCADE from `meetings` can never
+            // reach them. VectorStore's own delete paths already issue explicit
+            // DELETEs for exactly this reason, but deleteMeeting/clearAllData
+            // never call into it, so every deleted meeting left its vectors
+            // behind. Orphans then consume slots in the KNN top-K
+            // (searchSimilarNative silently drops ids it cannot resolve back to
+            // `chunks`), degrading recall monotonically with every deletion.
+            // Must run BEFORE the parent DELETE, while the chunk ids are still
+            // resolvable.
+            // R-12: the vector reap and the parent DELETE must be one unit. Ordering
+            // the reap first is required (the chunk ids must still resolve), but with
+            // no transaction a failure of the parent DELETE left the vectors gone and
+            // the meeting present. This was inert only while R-01 meant nothing was
+            // ever deleted; fixing R-01 makes it reachable.
+            // meetingDeleteObservers: features that follow a meeting out (its share
+            // link goes off) hear of it before, and settle once the delete held.
+            const removeMeeting = this.db.transaction((meetingId: string) => {
+                this.deleteVectorsForMeeting(meetingId);
+                return this.db!.prepare('DELETE FROM meetings WHERE id = ?').run(meetingId);
+            });
+            const info = runObservedMeetingDelete({ ids: [id] }, () => removeMeeting(id), (result) => result.changes > 0);
+            console.log(`[DatabaseManager] Deleted meeting ${id}. Changes: ${info.changes}`);
+            return info.changes > 0;
+        } catch (error) {
+            console.error(`[DatabaseManager] Failed to delete meeting ${id}:`, error);
+            return false;
+        }
+    }
+
+    /**
+     * Delete the vec0 index rows belonging to a meeting (F-705).
+     *
+     * vec0 virtual tables cannot participate in foreign-key cascades, so this
+     * has to be explicit. Resolves chunk/summary ids through the ordinary
+     * tables, so it MUST be called before the parent row is removed. Best-effort
+     * per dimension: a dimension table may legitimately not exist.
+     */
+    public deleteVectorsForMeeting(meetingId: string): void {
+        if (!this.db) return;
+        try {
+            const dims = this.getExistingVecDims();
+            if (!dims.length) return;
+            const chunkIds = (this.db.prepare('SELECT id FROM chunks WHERE meeting_id = ?')
+                .all(meetingId) as any[]).map((r) => r.id);
+            // R-01: chunk_summaries is keyed per-MEETING — (id, meeting_id UNIQUE,
+            // summary_text, embedding, created_at). There is no `chunk_id` column and
+            // no migration adds one, so the previous `JOIN chunks c ON c.id = cs.chunk_id`
+            // threw at prepare() time. That prepare sits outside the per-dim loop and
+            // inside the outer try, so the throw unwound past the per-dim catches into
+            // the outer catch — which only warns. The chunk deletes below were never
+            // reached and this function reaped nothing. Matches VectorStore.ts:676/725.
+            const summaryIds = (this.db.prepare('SELECT id FROM chunk_summaries WHERE meeting_id = ?')
+                .all(meetingId) as any[]).map((r) => r.id);
+            // SQLite caps bound parameters (measured 32766 in this build), so delete in
+            // batches rather than building one placeholder per chunk.
+            const BATCH = 500;
+            const deleteIn = (table: string, column: string, ids: number[]) => {
+                for (let i = 0; i < ids.length; i += BATCH) {
+                    const slice = ids.slice(i, i + BATCH);
+                    const ph = slice.map(() => '?').join(',');
+                    try {
+                        this.db!.prepare(`DELETE FROM ${table} WHERE ${column} IN (${ph})`).run(...slice);
+                    } catch (e: any) {
+                        // R-20: getExistingVecDims() returns KNOWN_DIMS ∪ discovered, so on a
+                        // normal install most dims have no table and "no such table" is the
+                        // expected, harmless outcome. Swallowing EVERYTHING else too meant a
+                        // real reap failure was indistinguishable from that — the same silence
+                        // that let R-01 hide for a full campaign. Narrow it.
+                        if (!/no such table/i.test(String(e?.message ?? e))) throw e;
+                    }
+                }
+            };
+            for (const dim of dims) {
+                if (chunkIds.length) deleteIn(`vec_chunks_${dim}`, 'chunk_id', chunkIds);
+                if (summaryIds.length) deleteIn(`vec_summaries_${dim}`, 'summary_id', summaryIds);
+            }
+        } catch (e) {
+            // R-20: R-12 wrapped this and the parent DELETE in one transaction so the
+            // meeting could not survive a failed reap. Swallowing here defeated that
+            // in the only direction that matters: the transaction saw no error and
+            // committed the DELETE anyway, leaving the meeting gone and its vectors
+            // orphaned in the vec0 tables — where they keep consuming KNN top-K slots
+            // that searchSimilarNative can no longer resolve back to `chunks`.
+            console.error(`[DatabaseManager] deleteVectorsForMeeting(${meetingId}) failed; aborting the delete:`, e);
+            throw e;
+        }
+    }
+
+    public getUnprocessedMeetings(): Meeting[] {
+        if (!this.db) return [];
+
+        // is_processed = 0 means false
+        const stmt = this.db.prepare(`
+            SELECT * FROM meetings
+            WHERE is_processed = 0
+            ORDER BY created_at DESC
+        `);
+
+        const rows = stmt.all() as any[];
+
+        return rows.map(row => {
+            // Reconstruct minimal meeting object for processing
+            // We mainly need ID to fetch transcripts later
+            const summaryData = JSON.parse(row.summary_json || '{}');
+            const minutes = Math.floor(row.duration_ms / 60000);
+            const seconds = Math.floor((row.duration_ms % 60000) / 1000);
+            const durationStr = `${minutes}:${seconds.toString().padStart(2, '0')}`;
+
+            return {
+                id: row.id,
+                title: row.title,
+                date: row.created_at,
+                duration: durationStr,
+                summary: summaryData.legacySummary || '',
+                detailedSummary: summaryData.detailedSummary,
+                calendarEventId: row.calendar_event_id,
+                source: row.source,
+                isProcessed: false,
+                summaryStatus: row.summary_status as SummaryStatus | undefined,
+                transcript: [] as any[], // Fetched separately via getMeetingDetails or manually if needed
+                usage: [] as any[]
+            };
+        });
+    }
+
+    public clearAllData(): boolean {
+        if (!this.db) return false;
+
+        try {
+            // Clear all tables atomically (order matters due to foreign keys,
+            // but SQLite handles cascades). Using a transaction ensures we never
+            // end up in a half-cleared state if one statement fails.
+            // meetingDeleteObservers hear 'all' before, and settle once it held
+            // (every share link goes off), or are told it did not.
+            const wipe = this.db.transaction(() => {
+                // F-705: vec0 virtual tables take no part in FK cascades, so a
+                // full wipe has to clear them explicitly too — otherwise
+                // "clear all data" left every embedding vector on disk.
+                for (const dim of this.getExistingVecDims()) {
+                    try { this.db!.exec(`DELETE FROM vec_chunks_${dim}`); } catch (_) { /* table may not exist */ }
+                    try { this.db!.exec(`DELETE FROM vec_summaries_${dim}`); } catch (_) { /* table may not exist */ }
+                }
+                this.db!.exec('DELETE FROM embedding_queue');
+                this.db!.exec('DELETE FROM chunk_summaries');
+                this.db!.exec('DELETE FROM chunks');
+                this.db!.exec('DELETE FROM ai_interactions');
+                this.db!.exec('DELETE FROM transcripts');
+                this.db!.exec('DELETE FROM meetings');
+                // A meeting in progress is data too (LiveMeetingJournal).
+                try { this.db!.exec('DELETE FROM live_meeting_journal'); } catch (_) { /* table may not exist */ }
+                try { this.db!.exec('DELETE FROM live_meeting_usage_overflow'); } catch (_) { /* table may not exist */ }
+                // Folders, tags, people and companies hold what the meetings said
+                // about people (and the user's notes on them): all data.
+                for (const table of ORGANISE_TABLES) {
+                    try { this.db!.exec(`DELETE FROM ${table}`); } catch (_) { /* table may not exist */ }
+                }
+            });
+            runObservedMeetingDelete('all', () => wipe(), () => true);
+
+            console.log('[DatabaseManager] All data cleared from database.');
+            return true;
+        } catch (error) {
+            console.error('[DatabaseManager] Failed to clear all data:', error);
+            return false;
+        }
+    }
+
+    public seedDemoMeeting() {
+        if (!this.db) return;
+
+        const demoId = 'demo-meeting';
+
+        // If a demo meeting already exists, only re-seed when it's the older
+        // legacy shape. A demo already carrying the V3 detailedSummary
+        // (schemaVersion === 3) is left untouched so we don't clobber it on
+        // every launch. Older legacy demos are deleted + re-seeded so users
+        // pick up the richer V3 cards without a manual reset.
+        const existing = this.db.prepare('SELECT summary_json FROM meetings WHERE id = ?').get(demoId) as { summary_json?: string } | undefined;
+        if (existing) {
+            let isV3Demo = false;
+            try {
+                const parsed = existing.summary_json ? JSON.parse(existing.summary_json) : null;
+                isV3Demo = parsed?.detailedSummary?.schemaVersion === 3;
+            } catch { /* corrupt row → treat as legacy, re-seed */ }
+            if (isV3Demo) {
+                console.log('[DatabaseManager] V3 demo meeting already exists, skipping seed.');
+                return;
+            }
+            console.log('[DatabaseManager] Upgrading legacy demo meeting to V3.');
+            this.deleteMeeting(demoId);
+        }
+
+        // Set date to today 9:30 AM
+        const today = new Date();
+        today.setHours(9, 30, 0, 0);
+
+        const durationMs = 300000; // 5 min
+
+        const summaryMarkdown = `# Overview
+
+Natively is a real-time AI meeting assistant designed to help you stay focused, informed, and fast-moving during calls. Get live insights while you speak, instant answers to questions, and structured notes after every meeting.
+
+# Getting Started
+
+### Start a Session
+Click **Start Session** from the dashboard.
+Join a scheduled meeting and start directly from the meeting notification.
+
+### During a Meeting
+- Use the **five quick action buttons** for real-time assistance
+- Show or hide Natively at any time:
+  - **Mac**: Cmd + B
+  - **Windows**: Ctrl + B
+- Move the widget anywhere on your screen by hovering over the top pill and dragging
+
+# Main Features
+
+## Five Quick Action Buttons
+- **What to answer**: Instantly generates a context-aware response to the current topic.
+- **Clarify**: Asks a targeted, senior-level clarifying question to establish constraints.
+- **Recap**: Generates a comprehensive summary of the conversation so far.
+- **Follow Up Question**: Suggests strategic questions you can ask to drive the conversation.
+- **Answer**: Manually trigger a response or use voice input to ask specific questions.
+
+## Meeting Insights (Launcher)
+- **Smart Note Taking**: Automatically captures key points, action items, and structured summaries.
+- **Summary**: A concise high-level brief of the entire meeting.
+- **Transcript**: Full real-time speech-to-text transcript, available during and after the call.
+- **Usage**: Track your interaction history and see how Natively assisted you.
+
+## Live Insights
+Click **Live Insights** during a call to view:
+- Real-time questions and prompts
+- Detected keywords and topics
+- Context-aware suggestions based on the conversation
+- Click any insight to get an instant response.
+
+## AI Chat
+- Type your question and press **Enter** or click **Submit**
+- Enable **Smart Mode** for advanced reasoning and coding assistance
+
+## Screenshots
+- **Full Screen Screenshot**: Cmd + H
+- **Selective Screenshot**: Cmd + Shift + H
+
+# Making the Most of Natively
+
+### Custom Context
+Upload resumes, project briefs, sales scripts, or other documents to tailor responses to your workflow. (coming soon).
+
+### Language Preferences
+Go to **Settings → Language Preferences** to:
+- Change input and output language
+- Enable real-time translation during calls
+
+### Undetectability
+Unlock the **Undetectability** add-on to keep Natively invisible during screen sharing.
+
+# Interface Basics
+
+- **Dashboard**: Start meetings and view recent activity
+- **Start Session**: Begin a new meeting instantly
+- **Settings**: Configure API keys, language, and visibility
+- **History**: Review past meetings, notes, and transcripts
+
+# API Setup
+
+1. Open **Settings**
+2. Scroll to **Credentials**
+3. Add your API keys:
+   - **Gemini**
+   - **Groq**
+4. To enable real-time transcription, select the location of your **Google Cloud service account JSON file**.
+
+If you don’t already have one, follow the steps below to create it.
+
+# Creating a Google Speech-to-Text Service Account
+
+## 1. Create or Select a Project
+- Open **Google Cloud Console**
+- Create a new project or select an existing one
+- Ensure billing is enabled
+
+## 2. Enable Speech-to-Text API
+- Go to **APIs & Services → Library**
+- Enable **Speech-to-Text API**
+
+## 3. Create a Service Account
+- Navigate to **IAM & Admin → Service Accounts**
+- Click **Create Service Account**
+- **Name**: natively-stt
+- **Description**: optional
+
+## 4. Assign Permissions
+- Grant the following role: **Speech-to-Text User** (\`roles/speech.client\`)
+
+## 5. Create a JSON Key
+- Open the service account
+- Go to **Keys → Add Key → Create new key**
+- Select **JSON**
+- Download the file
+
+**Once downloaded, return to Settings → Credentials in Natively and select this file to complete setup.**
+
+# Free Google Cloud Credit (New Users)
+
+New Google Cloud accounts receive **$300 in free credits**, valid for 90 days.
+
+To activate:
+1. Visit [cloud.google.com](https://cloud.google.com)
+2. Click **Get started for free**
+3. Sign in with a Google account
+4. Add billing details (card required)
+5. Activate the free trial
+
+The credit can be used for Speech-to-Text and is sufficient for extended testing and regular usage.
+
+# Support
+
+If you need help with setup or usage, contact us anytime at:
+support@heynatively.com`;
+
+        const demoMeeting: Meeting = {
+            id: demoId,
+            title: "Natively Demo & Guide",
+            date: today.toISOString(),
+            duration: "5:00",
+            summary: "Complete guide to using Natively - your real-time AI meeting assistant.",
+            detailedSummary: {
+                // schemaVersion: 3 unlocks the full V3 notes layout + all four cards.
+                schemaVersion: 3,
+                overview: summaryMarkdown,
+                actionItems: [],
+                keyPoints: [],
+
+                // Summary bullets (blue-dot list at the top of the notes).
+                tldr: [
+                    "Natively runs live during calls — real-time answers plus structured notes after.",
+                    "Five quick actions: What to answer, Clarify, Recap, Follow-up, and Answer.",
+                    "Cmd/Ctrl + B hides the widget instantly; screenshots via Cmd + H.",
+                ],
+
+                // The mode's note-section template — primary notes layout.
+                sectionsV3: [
+                    {
+                        id: 'sec_getting_started',
+                        title: 'Getting started',
+                        order: 0,
+                        bullets: [
+                            { id: 'b1', text: "Click Start Session from the dashboard to begin a call.", confidence: 'high' },
+                            { id: 'b2', text: "Show or hide Natively anytime with Cmd + B (Mac) or Ctrl + B (Windows).", confidence: 'high' },
+                        ],
+                    },
+                    {
+                        id: 'sec_features',
+                        title: 'Key features',
+                        order: 1,
+                        bullets: [
+                            { id: 'b3', text: "Five quick-action buttons give real-time, context-aware assistance.", confidence: 'high' },
+                            { id: 'b4', text: "Smart note-taking captures key points, action items, and a structured summary.", confidence: 'medium' },
+                        ],
+                    },
+                    {
+                        id: 'sec_setup',
+                        title: 'Setup',
+                        order: 2,
+                        bullets: [
+                            { id: 'b5', text: "Add Gemini and Groq API keys under Settings → Credentials.", confidence: 'high' },
+                            { id: 'b6', text: "Select a Google Cloud service-account JSON to enable live transcription.", confidence: 'medium' },
+                        ],
+                    },
+                ],
+
+                // CARD 1 — source quality warning (non-benign warnings render).
+                sourceQuality: {
+                    transcriptCoverage: 0.82,
+                    speakerQuality: 'mixed' as const,
+                    actionItemConfidence: 'medium' as const,
+                    warnings: [
+                        "Speaker labels are low quality; verify owners and quotes before sharing.",
+                    ],
+                },
+
+                // CARD 2 — mode auto-detect suggestion (detected differs from selected, conf ≥ 0.5).
+                mode: {
+                    selectedModeId: 'mode_general_default',
+                    selectedModeName: 'General',
+                    selectedTemplateType: 'general',
+                    detectedModeId: 'mode_product_demo',
+                    detectedModeName: 'Product Demo',
+                    detectedConfidence: 0.78,
+                    summaryModeUsed: 'general',
+                },
+
+                // CARD 3 — cross-meeting recall (stillOpen non-empty).
+                crossMeeting: {
+                    stillOpen: [
+                        "Finish uploading your resume / project brief for tailored answers (from Onboarding).",
+                        "Enable Undetectability before your next screen-shared call (from Setup walkthrough).",
+                    ],
+                },
+
+                // Follow-up draft — exercises the copy / regenerate / tone dropdown row.
+                followUpDraft: {
+                    type: 'email',
+                    subject: "Getting started with Natively",
+                    body: "Hi there,\n\nThanks for trying Natively! A quick recap: start a session from the dashboard, use the five quick actions during your call, and press Cmd + B to hide the widget anytime. Notes, transcript, and follow-ups are waiting for you after every meeting.\n\nBest,\nThe Natively team",
+                    tone: 'professional',
+                },
+            },
+            transcript: [
+                { speaker: 'interviewer', text: "Welcome to Natively! Let me show you how it works.", timestamp: 0 },
+                { speaker: 'user', text: "Thanks! I'm excited to try it out.", timestamp: 5000 },
+                { speaker: 'interviewer', text: "You have 5 quick action buttons. 'What to answer' listens to the conversation and suggests what you should say.", timestamp: 10000 },
+                { speaker: 'user', text: "That sounds helpful for interviews.", timestamp: 18000 },
+                { speaker: 'interviewer', text: "Check out the 'How to Use' section in the notes for API setup instructions.", timestamp: 20000 },
+                { speaker: 'interviewer', text: "'Clarify' asks a targeted question to get missing constraints. 'Recap' summarizes the entire conversation so far.", timestamp: 22000 },
+                { speaker: 'user', text: "What about the other buttons?", timestamp: 30000 },
+                { speaker: 'interviewer', text: "'Follow Up Questions' suggests questions you can ask. 'Answer' lets you speak a question and get an instant response.", timestamp: 35000 },
+                { speaker: 'user', text: "Can I take screenshots during calls?", timestamp: 45000 },
+                { speaker: 'interviewer', text: "Yes! Press Cmd+H for full screen or Cmd+Shift+H to select an area. The AI will analyze it and help you.", timestamp: 50000 },
+                { speaker: 'user', text: "How do I hide Natively during screen share?", timestamp: 60000 },
+                { speaker: 'interviewer', text: "Press Cmd+B to toggle visibility anytime. You can also enable undetectable mode in settings.", timestamp: 65000 },
+                { speaker: 'user', text: "This is amazing. What happens after the call?", timestamp: 75000 },
+                { speaker: 'interviewer', text: "You get detailed meeting notes with action items, key points, full transcript, and a log of all AI interactions.", timestamp: 80000 }
+            ],
+            usage: [
+                { type: 'assist', timestamp: 15000, question: 'What features does Natively have?', answer: 'Natively offers 5 quick action buttons, screenshot analysis, real-time transcription, and comprehensive meeting notes.' },
+                { type: 'followup', timestamp: 40000, question: 'How do the action buttons work?', answer: 'Each button serves a specific purpose: suggest answers, clarify questions, recap conversations, generate follow-up questions, or get instant voice-to-answer responses.' }
+            ],
+            isProcessed: true
+        };
+
+        this.saveMeeting(demoMeeting, today.getTime(), durationMs);
+        console.log('[DatabaseManager] Seeded demo meeting.');
+    }
+}

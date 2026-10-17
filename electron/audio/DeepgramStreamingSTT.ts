@@ -1,0 +1,431 @@
+/**
+ * DeepgramStreamingSTT - SDK-based streaming Speech-to-Text using Deepgram Nova-3
+ *
+ * Uses @deepgram/sdk v3 (listen.live) instead of raw WebSocket.
+ * Implements the same EventEmitter interface as GoogleSTT:
+ *   Events: 'transcript' ({ text, isFinal, confidence }), 'error' (Error)
+ *   Methods: start(), stop(), write(chunk), setSampleRate(), setAudioChannelCount()
+ */
+
+import { EventEmitter } from 'events';
+import { nextVoiceEpoch } from './sttDiarization';
+import { deepgramHintParams, getSttContextTerms } from './sttContextTerms';
+import { RECOGNITION_LANGUAGES } from '../config/languages';
+import { RealtimeSilenceTail } from './realtimeSilenceTail';
+import { isEnglishOnlySttModel, sttModelRejectsLanguage, resolveSttModel } from './sttModelCatalog';
+
+const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 30000;
+const RECONNECT_MAX_ATTEMPTS = 10;
+const KEEPALIVE_INTERVAL_MS = 8000;
+// Real-time silence streamed after the local VAD's speech end. endpointing
+// (300 ms, below) already fires inside the native hangover (>= 500 ms), but
+// UtteranceEnd needs a 1000 ms gap after the last word — at the keepalive
+// cadence (20 ms per 100 ms) that gap took ~2.6 s of wall time to accumulate.
+// hangover (>= 500) + 700 = 1200 ms of real silence covers it with margin.
+// See realtimeSilenceTail.ts.
+export const DEEPGRAM_SILENCE_TAIL_MS = 700;
+
+export class DeepgramStreamingSTT extends EventEmitter {
+    private apiKey: string;
+    private live: any = null;
+    private isActive = false;
+    private shouldReconnect = false;
+    private isOpen = false; // tracks whether SDK connection is in OPEN state
+
+    private sampleRate = 16000;
+    private numChannels = 1;
+    private languageCode = 'en';
+
+    private reconnectAttempts = 0;
+    private reconnectTimer: NodeJS.Timeout | null = null;
+    // 5s post-connect timer that resets reconnectAttempts so a clean
+    // session doesn't inherit the prior session's backoff counter. The
+    // setTimeout used to be untracked — its handle was thrown away —
+    // which meant stop() could not cancel it. If stop()/restart fired
+    // within the 5s window, the orphan timer would fire on the NEXT
+    // session and clobber its reconnectAttempts to 0, defeating the
+    // exponential backoff cap on a rapid-reconnect storm.
+    private stabilityTimer: NodeJS.Timeout | null = null;
+    private keepAliveInterval: NodeJS.Timeout | null = null;
+    private buffer: Buffer[] = [];
+    private isConnecting = false;
+    // Opt-in provider diarization (#3). When on, Deepgram returns a per-word `speaker`
+    // index; we surface it as a canonical speakerId on the transcript event so multiple
+    // remote speakers can be distinguished. Default OFF — must never destabilize the
+    // realtime path for users who don't enable it.
+    private diarize = false;
+    private readonly silenceTail = new RealtimeSilenceTail({
+        tailMs: DEEPGRAM_SILENCE_TAIL_MS,
+        format: () => ({ sampleRate: this.sampleRate, channels: this.numChannels }),
+        sink: (pcm) => this.sendAudio(pcm),
+    });
+
+    /** The Deepgram model (sttModelCatalog.ts). Every catalogued model runs on
+     *  this same v1 live endpoint with the options below. */
+    private readonly model: string;
+
+    constructor(apiKey: string, model?: string) {
+        super();
+        this.apiKey = apiKey;
+        this.model = resolveSttModel('deepgram', model);
+    }
+
+    /** What the connect options carry: an English-only model (Nova-3 Medical,
+     *  Nova-2 Meeting) is always sent English, since Deepgram rejects `multi`
+     *  or another language for it. Settings narrows the Language picker to
+     *  English for these models too; this covers a language stored earlier. */
+    private connectLanguage(): string {
+        if (isEnglishOnlySttModel('deepgram', this.model) && !this.languageCode.startsWith('en')) return 'en';
+        // A multilingual model that has no such language (Nova-3 and Malayalam)
+        // would refuse the connection outright; `multi` keeps the meeting
+        // transcribing. Settings hides these languages for the model too.
+        if (sttModelRejectsLanguage('deepgram', this.model, this.languageCode)) return 'multi';
+        return this.languageCode;
+    }
+
+    /** Local VAD: the speaker stopped. Keep the endpointer's clock real-time. */
+    public notifySpeechEnded(): void {
+        if (!this.isActive) return;
+        this.silenceTail.start();
+    }
+
+    /** Enable/disable provider diarization. Restarts the stream if active (it's a connect param). */
+    public setDiarization(enabled: boolean): void {
+        if (this.diarize === enabled) return;
+        this.diarize = enabled;
+        console.log(`[DeepgramStreaming] Diarization ${enabled ? 'enabled' : 'disabled'}`);
+        if (this.isActive) this.restartStream();
+    }
+
+    public setSampleRate(rate: number): void {
+        if (this.sampleRate === rate) return;
+        this.sampleRate = rate;
+        console.log(`[DeepgramStreaming] Sample rate set to ${rate}`);
+        if (this.isActive) this.restartStream();
+    }
+
+    public setAudioChannelCount(count: number): void {
+        if (this.numChannels === count) return;
+        this.numChannels = count;
+        console.log(`[DeepgramStreaming] Channel count set to ${count}`);
+        if (this.isActive) this.restartStream();
+    }
+
+    public setRecognitionLanguage(key: string): void {
+        if (key === 'auto') {
+            if (this.languageCode === 'multi') return;
+            this.languageCode = 'multi';
+            console.log('[DeepgramStreaming] Language set to multilingual (multi)');
+            if (this.isActive) this.restartStream();
+            return;
+        }
+        const config = RECOGNITION_LANGUAGES[key];
+        if (config && this.languageCode !== config.iso639) {
+            this.languageCode = config.iso639;
+            console.log(`[DeepgramStreaming] Language set to ${this.languageCode}`);
+            if (this.isActive) this.restartStream();
+        }
+    }
+
+    public setCredentials(_path: string): void { }
+
+    private restartStream(): void {
+        console.log('[DeepgramStreaming] Restarting due to config change...');
+        this.stop();
+        this.start();
+    }
+
+    public start(): void {
+        if (this.isActive) return;
+        this.isActive = true;
+        this.shouldReconnect = true;
+        this.reconnectAttempts = 0;
+        this.connect();
+    }
+
+    public stop(): void {
+        this.shouldReconnect = false;
+        this.silenceTail.cancel();
+        this.clearTimers();
+
+        if (this.live) {
+            try {
+                this.live.requestClose();
+            } catch {
+                // ignore errors during shutdown
+            }
+            this.live = null;
+        }
+
+        this.isActive = false;
+        this.isConnecting = false;
+        this.isOpen = false;
+        this.buffer = [];
+        console.log('[DeepgramStreaming] Stopped');
+    }
+
+    public finalize(): void {
+        if (!this.isActive || !this.isOpen || !this.live) return;
+        try {
+            this.live.finalize();
+            console.log('[DeepgramStreaming] Sent Finalize to flush server buffer');
+        } catch (err: any) {
+            console.error('[DeepgramStreaming] Finalize failed:', err?.message);
+        }
+    }
+
+    public write(chunk: Buffer): void {
+        if (!this.isActive) return;
+        this.silenceTail.observe(chunk);
+        this.sendAudio(chunk);
+    }
+
+    private sendAudio(chunk: Buffer): void {
+        if (!this.isActive) return;
+
+        if (!this.isOpen) {
+            this.buffer.push(chunk);
+            if (this.buffer.length > 500) this.buffer.shift();
+
+            if (!this.isConnecting && this.shouldReconnect && !this.reconnectTimer) {
+                this.connect();
+            }
+            return;
+        }
+
+        try {
+            this.live.send(chunk);
+        } catch (err: any) {
+            console.error('[DeepgramStreaming] Send error:', err?.message);
+        }
+    }
+
+    private hintTerms(): Record<string, string[]> {
+        return deepgramHintParams(this.model, getSttContextTerms());
+    }
+
+    private connect(): void {
+        if (this.isConnecting) return;
+        this.isConnecting = true;
+        // Deepgram numbers voices afresh on every connection: this one's lines
+        // carry its own window number (sttDiarization.nextVoiceEpoch).
+        const voiceEpoch = nextVoiceEpoch();
+
+        console.log(`[DeepgramStreaming] Connecting (rate=${this.sampleRate}, ch=${this.numChannels}, lang=${this.languageCode})...`);
+
+        try {
+            const { createClient, LiveTranscriptionEvents } = require('@deepgram/sdk');
+
+            const deepgram = createClient(this.apiKey);
+
+            this.live = deepgram.listen.live({
+                model: this.model,
+                language: this.connectLanguage(),
+                smart_format: true,
+                // smart_format HOLDS a streaming final when the utterance ends
+                // in what looks like an incomplete entity (a number, a date),
+                // "until the speaker continues to non-entity speech, OR ...
+                // after 3 seconds of silence" (developers.deepgram.com/docs/
+                // smart-format) — and that silence is audio time, which the
+                // native keepalive stretches ~5×. no_delay releases the final
+                // immediately; formatting still applies where it is ready.
+                no_delay: true,
+                interim_results: true,
+                encoding: 'linear16',
+                sample_rate: this.sampleRate,
+                channels: this.numChannels,
+                endpointing: 300,
+                utterance_end_ms: 1000,
+                vad_events: true,
+                // Opt-in: ask Deepgram to tag each word with a speaker index.
+                ...(this.diarize ? { diarize: true } : {}),
+                // The user's name (sttContextTerms.ts). Nova-3 takes keyterm and
+                // rejects keywords; Nova-2 takes keywords. The SDK repeats an array
+                // as one query parameter per term, as both expect.
+                ...this.hintTerms(),
+            });
+
+            // F-203: identity guard. restartStream() does a synchronous
+            // stop()+start() without detaching listeners, so the OLD
+            // connection's events would otherwise run against the NEW one:
+            // flipping isOpen/isConnecting for the wrong connection,
+            // registering a SECOND Transcript listener on the live connection
+            // (every final emitted twice into handleTranscript and the RAG
+            // feed), and clearing the live keepalive timers so Deepgram
+            // idle-closes it. Mirrors NativelyProSTT's documented pattern.
+            const live = this.live;
+
+            this.live.on(LiveTranscriptionEvents.Open, () => {
+                if (live !== this.live) return; // F-203 stale-connection guard
+                this.isConnecting = false;
+                this.isOpen = true;
+                console.log('[DeepgramStreaming] Connected');
+
+                // Register Transcript inside Open per SDK README pattern.
+                // Bound to the captured `live` so a stale Open can never add a
+                // duplicate listener to the current connection.
+                live.on(LiveTranscriptionEvents.Transcript, (data: any) => {
+                    try {
+                        const alt = data.channel?.alternatives?.[0];
+                        const transcript = alt?.transcript;
+                        const isFinal = data.is_final ?? false;
+                        console.log(`[DeepgramStreaming] Transcript event`, { final: isFinal, length: transcript?.length ?? 0 });
+                        // Auto Answer V3 endpoint normalization (additive):
+                        // live-verified (2026-08-24) that Deepgram delivers
+                        // speech_final=true on trailing EMPTY-transcript results
+                        // after endpointing silence — the endpoint must be
+                        // surfaced BEFORE the empty-transcript return below.
+                        // For a text-carrying final, the transcript is emitted
+                        // first (further down) and this fires after it, keeping
+                        // endpoint-after-final ordering for consumers.
+                        const speechFinal = isFinal && data.speech_final === true;
+                        if (!transcript) {
+                            if (speechFinal) this.emit('endpoint', { type: 'speech_final' });
+                            return;
+                        }
+                        // Opt-in diarization: derive the dominant speaker index across the words
+                        // in this result and surface it as a canonical id (speaker_<n+1>). Only
+                        // emitted when diarize is on AND a numeric speaker index is present, so
+                        // the default payload shape is byte-for-byte unchanged for everyone else.
+                        let speakerId: string | undefined;
+                        if (this.diarize) {
+                            const idx = dominantSpeakerIndex(alt?.words);
+                            if (idx !== undefined) speakerId = `speaker_${idx + 1}`;
+                        }
+                        this.emit('transcript', {
+                            text: transcript,
+                            isFinal,
+                            confidence: alt?.confidence ?? 1.0,
+                            ...(speakerId ? { speakerId, voiceEpoch } : {}),
+                        });
+                        // Auto Answer V3 endpoint normalization (additive): Deepgram
+                        // distinguishes is_final (segment) from speech_final (utterance).
+                        if (speechFinal) {
+                            this.emit('endpoint', { type: 'speech_final' });
+                        }
+                    } catch (err) {
+                        console.error('[DeepgramStreaming] Parse error:', err);
+                    }
+                });
+
+                // Flush buffered audio
+                const buffered = this.buffer.splice(0);
+                for (const chunk of buffered) {
+                    try { this.live?.send(chunk); } catch { }
+                }
+                if (buffered.length > 0) {
+                    console.log(`[DeepgramStreaming] Flushed ${buffered.length} buffered chunks`);
+                }
+
+                // SDK keepAlive() every 8s prevents idle timeout (per Deepgram docs)
+                this.keepAliveInterval = setInterval(() => {
+                    if (this.isOpen) {
+                        try { this.live?.keepAlive(); } catch { }
+                    }
+                }, KEEPALIVE_INTERVAL_MS);
+
+                // Reset backoff only after 5s of stable connection.
+                // Tracked on this.stabilityTimer so stop()/clearTimers() can
+                // cancel it; otherwise the orphan would fire inside the next
+                // session and reset reconnectAttempts mid-backoff.
+                if (this.stabilityTimer) clearTimeout(this.stabilityTimer);
+                this.stabilityTimer = setTimeout(() => {
+                    this.stabilityTimer = null;
+                    if (this.isOpen) this.reconnectAttempts = 0;
+                }, 5000);
+            });
+
+            // UtteranceEnd (utterance_end_ms above) — the fallback endpoint when
+            // no speech_final fired for the utterance. Additive; nothing else
+            // consumes it.
+            this.live.on(LiveTranscriptionEvents.UtteranceEnd, () => {
+                try { this.emit('endpoint', { type: 'utterance_end' }); } catch { /* listeners never break the socket */ }
+            });
+
+            this.live.on(LiveTranscriptionEvents.Error, (err: any) => {
+                if (live !== this.live) return; // F-203 stale-connection guard
+                console.error('[DeepgramStreaming] Error:', err);
+                this.emit('error', err instanceof Error ? err : new Error(String(err)));
+            });
+
+            this.live.on(LiveTranscriptionEvents.Close, (event: any) => {
+                if (live !== this.live) return; // F-203 stale-connection guard
+                const code = event?.code ?? 'unknown';
+                const reason = event?.reason || '(empty)';
+                console.log(`[DeepgramStreaming] Closed (code=${code}, reason=${reason})`);
+
+                this.isOpen = false;
+                this.isConnecting = false;
+                this.clearTimers();
+
+                if (this.shouldReconnect && code !== 1000) {
+                    this.scheduleReconnect();
+                }
+            });
+
+        } catch (err: any) {
+            console.error('[DeepgramStreaming] Initialization error:', err?.message);
+            this.isConnecting = false;
+            if (this.shouldReconnect) this.scheduleReconnect();
+        }
+    }
+
+    private scheduleReconnect(): void {
+        if (!this.shouldReconnect) return;
+
+        // Discard stale buffered audio — replaying seconds-old audio on reconnect
+        // overwhelms Deepgram's real-time endpoint and causes EPIPE storms.
+        this.buffer = [];
+
+        if (this.reconnectAttempts >= RECONNECT_MAX_ATTEMPTS) {
+            console.error(`[DeepgramStreaming] Max reconnect attempts reached — giving up`);
+            this.emit('error', new Error('DeepgramStreamingSTT: max reconnect attempts exceeded'));
+            return;
+        }
+
+        const delay = Math.min(
+            RECONNECT_BASE_DELAY_MS * Math.pow(2, this.reconnectAttempts),
+            RECONNECT_MAX_DELAY_MS
+        );
+        this.reconnectAttempts++;
+
+        console.log(`[DeepgramStreaming] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${RECONNECT_MAX_ATTEMPTS})...`);
+
+        this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null;
+            if (this.shouldReconnect) this.connect();
+        }, delay);
+    }
+
+    private clearTimers(): void {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        if (this.stabilityTimer) {
+            clearTimeout(this.stabilityTimer);
+            this.stabilityTimer = null;
+        }
+        if (this.keepAliveInterval) {
+            clearInterval(this.keepAliveInterval);
+            this.keepAliveInterval = null;
+        }
+    }
+}
+
+// Pick the most-frequent speaker index across a Deepgram result's words. Deepgram emits a
+// per-word integer `speaker` when diarize=true. Returns undefined when no numeric index is
+// present (diarization off, or pre-diarization SDK shape) so the caller omits speakerId.
+function dominantSpeakerIndex(words: any): number | undefined {
+    if (!Array.isArray(words) || words.length === 0) return undefined;
+    const counts = new Map<number, number>();
+    for (const w of words) {
+        const s = w?.speaker;
+        if (typeof s === 'number' && Number.isFinite(s) && s >= 0) counts.set(s, (counts.get(s) || 0) + 1);
+    }
+    if (counts.size === 0) return undefined;
+    let best = -1; let bestCount = -1;
+    for (const [idx, c] of counts) if (c > bestCount) { best = idx; bestCount = c; }
+    return best >= 0 ? best : undefined;
+}

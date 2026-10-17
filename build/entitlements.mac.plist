@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Natively — TOP-LEVEL app entitlements (Hardened Runtime, Developer ID, notarized).
+      Non-sandboxed (no com.apple.security.app-sandbox). Every entitlement below is
+      individually justified; nothing speculative is included.
+
+      Privacy access (Microphone, Screen Recording, Accessibility, System Audio) is
+      governed by TCC + the NS*UsageDescription strings in Info.plist (set via
+      package.json build.mac.extendInfo) and user consent — NOT by entitlements,
+      except the one hardened-runtime mic capability below.
+    -->
+
+    <!-- V8 JavaScript engine JIT. REQUIRED for Electron/Chromium under Hardened Runtime. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <!-- V8 writes executable memory. Electron <12 required this; kept for V8/Chromium
+         compatibility on the versions/native paths we ship. Low-risk, standard for Electron. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- REQUIRED: Natively loads third-party native libraries not signed by our Team ID
+         (e.g. onnxruntime's libonnxruntime.dylib, better-sqlite3, sqlite-vec, sharp, and
+         our Rust native module). Hardened Runtime would otherwise refuse to load them. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- Microphone capture (Rust cpal / MicrophoneCapture). Hardened-runtime capability;
+         paired with NSMicrophoneUsageDescription (Info.plist) which TCC shows to the user. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- Apple Calendar (EventKit, native-module/src/calendar_events.rs). The Hardened
+         Runtime's "Calendars" resource-access capability: without it a signed build's
+         request is refused without a prompt. Not restricted (no provisioning profile).
+         Paired with NSCalendarsFullAccessUsageDescription / NSCalendarsUsageDescription
+         (Info.plist, package.json build.mac.extendInfo). Top-level only: EventKit is
+         read from the main process. -->
+    <key>com.apple.security.personal-information.calendars</key>
+    <true/>
+
+    <!--
+      KEYCHAIN ACCESS GROUP — REMOVED 2026-08-19. DO NOT RE-ADD WITHOUT A PROFILE.
+
+      `keychain-access-groups` is a RESTRICTED (profile-requiring) entitlement. macOS only
+      honours it when the signed bundle embeds a matching provisioning profile. This build signs
+      with `provisioningProfile=none`, so AMFI rejected the binary at exec:
+
+        amfid: ... not valid: AppleMobileFileIntegrityError Code=-413 "No matching profile found"
+        kernel AMFI: Code has restricted entitlements, but the validation of its code
+          signature failed.  Unsatisfied Entitlements:
+        kernel: proc NNNN: load code signature error 4 for file "Natively"
+
+      The kernel kills the process before dyld runs, so NOTHING catches this: no crash report is
+      written, and `spctl -a`, a strict deep `codesign` verify and `stapler validate` all keep
+      reporting the bundle as perfect. 2.8.6 signed, notarized and stapled cleanly and still could
+      not launch — `open` reported only `RBSRequestErrorDomain Code=5` / POSIX 163 "Launchd job
+      spawn failed". Proven by A/B: two copies of an identical trivial binary signed with the same
+      Developer ID identity, differing ONLY by this entitlement — the one carrying it is SIGKILLed
+      (exit 137), the other runs.
+
+      This does NOT resolve issue #322; it restores the 2.8.5 status quo. The recovery path
+      (three failed cold starts escalate to needsCredentialReentry rather than an unrecoverable
+      empty state) is untouched and remains the mitigation. Re-adding this entitlement REQUIRES
+      registering an App ID for com.apple.corespeechd with Keychain Sharing, generating a
+      Developer ID provisioning profile, and wiring mac.provisioningProfile in
+      electron-builder.signed.cjs — and that route carries its own reported risk of a
+      login-keychain prompt on every launch (electron/electron#47341), so it must be verified on a
+      signed build BEFORE it ships. KeychainEntitlement.test.mjs pins the absence.
+    -->
+
+    <!--
+      INTENTIONALLY OMITTED (verified against Apple docs + codebase audit, 2026-05-29):
+        * com.apple.security.screen-capture        — NOT a real Apple entitlement.
+          ScreenCaptureKit + the CoreAudio process tap are pure-TCC (Screen & System
+          Audio Recording) gated by NSScreenCaptureUsageDescription + user consent.
+        * com.apple.security.automation.apple-events — no AppleScript/osascript usage
+          anywhere in the codebase.
+        * com.apple.security.cs.allow-dyld-environment-variables — no DYLD_* env usage
+          in app or native code; not part of the Electron hardened-runtime baseline.
+      Accessibility (global keyboard tap) is pure TCC via AXIsProcessTrusted — no
+      entitlement and no usage string.
+    -->
+</dict>
+</plist>

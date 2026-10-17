@@ -1,0 +1,214 @@
+#!/usr/bin/env node
+/**
+ * Fast electron build using esbuild (transpile-only, no type checking).
+ * ~10-50x faster than `tsc` for dev builds.
+ * Run `npm run typecheck:electron` separately for type safety.
+ */
+
+const { build, context } = require('esbuild');
+
+// `--watch` replaces the old `tsc -p electron/tsconfig.json --watch` script. That
+// script emitted via tsc, which is incompatible with module:"Preserve" (the
+// TS7-legal setting) — and tsc has not been the emitter for dist-electron for a
+// long time anyway. Type-checking in watch mode is `tsc --noEmit --watch`.
+const WATCH = process.argv.includes('--watch');
+// Fork pull requests cannot receive the repository secret needed to fetch the
+// private premium submodule. This opt-in mode still bundles every core Electron
+// entrypoint, but leaves private runtime imports unresolved for the packaged
+// premium build to supply. Normal development and release builds are unchanged.
+const CORE_SMOKE = process.env.NATIVELY_CORE_SMOKE === '1';
+const path = require('path');
+const fs = require('fs');
+
+const rootDir = path.resolve(__dirname, '..');
+const outDir = path.resolve(rootDir, 'dist-electron');
+
+const entryPoints = [];
+
+// Function to recursively find all .ts files in a directory
+const findTs = (dir) => {
+  const results = [];
+  for (const f of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, f.name);
+    if (f.isDirectory()) results.push(...findTs(full));
+    else if (f.name.endsWith('.ts') && !f.name.endsWith('.d.ts')) results.push(full);
+  }
+  return results;
+};
+
+const electronDir = path.resolve(rootDir, 'electron');
+if (fs.existsSync(electronDir)) {
+  entryPoints.push(...findTs(electronDir).map(f => path.relative(rootDir, f)));
+}
+
+// Also include premium electron files if they exist
+const premiumDir = path.resolve(rootDir, 'premium/electron');
+if (fs.existsSync(premiumDir)) {
+  entryPoints.push(...findTs(premiumDir).map(f => path.relative(rootDir, f)));
+}
+
+const start = Date.now();
+
+const coreSmokePremiumExternalPlugin = {
+  name: 'core-smoke-premium-external',
+  setup(esbuild) {
+    esbuild.onResolve({ filter: /^(?:\.\.\/)+premium(?:\/|$)/ }, (args) => ({
+      path: args.path,
+      external: true,
+    }));
+  },
+};
+
+// Calendar sync's Google client secret is baked in here rather than committed:
+// see scripts/lib/calendar-client-secret.cjs. Empty when unset, which leaves
+// calendar sync unable to connect; scripts/package-app.js refuses to package an
+// installer from such a build.
+const {
+  BAKED_EXPRESSION: CALENDAR_SECRET_EXPRESSION,
+  ENV_NAME: CALENDAR_SECRET_ENV,
+  resolveCalendarClientSecret,
+} = require('./lib/calendar-client-secret.cjs');
+const calendarClientSecret = resolveCalendarClientSecret(rootDir);
+if (!calendarClientSecret) {
+  console.warn(`[build-electron] ${CALENDAR_SECRET_ENV} is not set (env or .env): calendar sync will not connect in this build.`);
+}
+
+// Outlook calendar's Microsoft app registration (a public client: an ID, no
+// secret), baked in the same way. Not a secret, so it may also live in .env.
+// Empty leaves the Outlook row in Settings disabled with a one-line note; see
+// docs/microsoft-calendar-setup.md.
+const { resolveMicrosoftCalendarConfig, MICROSOFT_ID_EXPRESSION, MICROSOFT_TENANT_EXPRESSION } = require('./lib/microsoft-calendar-client.cjs');
+const microsoftCalendar = resolveMicrosoftCalendarConfig(rootDir);
+if (!microsoftCalendar.clientId) {
+  console.warn('[build-electron] MICROSOFT_CALENDAR_CLIENT_ID is not set (env or .env): the Outlook calendar row will be disabled in this build.');
+}
+
+const buildOptions = {
+  entryPoints,
+  define: {
+    [CALENDAR_SECRET_EXPRESSION]: JSON.stringify(calendarClientSecret),
+    [MICROSOFT_ID_EXPRESSION]: JSON.stringify(microsoftCalendar.clientId),
+    [MICROSOFT_TENANT_EXPRESSION]: JSON.stringify(microsoftCalendar.tenant),
+  },
+  bundle: true,           // resolve all static + dynamic imports so postProcessor
+                         // is inlined and the path rewrite works (vs bundle:false
+                         // which copies files as-is and leaves unresolved relative paths)
+  outdir: outDir,
+  outbase: rootDir,       // preserve directory structure (electron/main.ts → dist-electron/electron/main.js)
+  platform: 'node',
+  target: 'node20',
+  format: 'cjs',          // Electron loads package.json main as CommonJS in this repo
+                          // (package.json has no "type": "module").
+  external: [
+    'electron',
+    'better-sqlite3',
+    'keytar',
+    'sqlite-vec',
+    '@vectorize-io/hindsight-client',
+    // onnxruntime-node ships a compiled `.node` binary. Every other ONNX
+    // consumer in this codebase (Whisper, LocalReranker, LocalEmbeddingProvider,
+    // LocalEmbeddingProvider) only reaches it indirectly through @huggingface/transformers'
+    // own dynamic loading, which doesn't trip esbuild's bundler. The Nemotron
+    // ONNX modules (electron/audio/whisper/nemotron/) are the first place
+    // with a direct static `import ... from 'onnxruntime-node'`, and esbuild
+    // can't bundle a native binary — it throws "No loader configured for
+    // .node files". Externalizing keeps it loadable from node_modules at
+    // runtime instead. (onnxruntime-common is a transitive dep of
+    // onnxruntime-node but does NOT need to be listed here: once
+    // onnxruntime-node itself is external, esbuild never traverses into its
+    // internals to see the nested `require('onnxruntime-common')` call —
+    // verified empirically by removing it and rebuilding clean, and by
+    // confirming no first-party file imports onnxruntime-common directly.)
+    'onnxruntime-node',
+    // Heavy native ESM modules with `import.meta.url`-dependent init. Keeping
+    // them external lets Node's loader give them a real `import.meta.url`,
+    // which the bundled version can't (esbuild's CJS target sets
+    // `import_meta = {}`). pdfjs-dist's legacy build runs a canvas/DOMMatrix
+    // polyfill block at module-init that uses
+    // `createRequire(import.meta.url)` to load `@napi-rs/canvas`; the
+    // bundled version breaks this and `new DOMMatrix()` then throws
+    // "DOMMatrix is not a constructor" at line 15620 (`const SCALE_MATRIX
+    // = new DOMMatrix();`). The bundling also breaks pdf-parse@2.x's
+    // fake-worker bootstrap (workerSrc resolves to a non-existent
+    // dist-electron/electron/pdf.worker.mjs). Externalizing keeps them
+    // loadable from node_modules at runtime, where the real polyfill chain
+    // works and our pinPdfjsWorkerSrcOnce() helper can resolve the real
+    // worker file.
+    'pdfjs-dist',
+    'pdf-parse',
+    'mammoth',
+    // sharp 0.35 requires its prebuilt binding through STATIC paths
+    // (`require('./lib/sharp-darwin-arm64-<version>.node')` inside each
+    // @img/sharp-<platform> package) so that bundlers can follow them. esbuild
+    // does follow them and stops with "No loader is configured for .node
+    // files". Up to 0.34 the binding was reached through a template-string
+    // require esbuild could not resolve, so sharp's JavaScript was inlined and
+    // the binding was still found in node_modules at runtime. Externalizing
+    // keeps the same runtime lookup: sharp and @img/** are shipped in
+    // node_modules and listed in build.asarUnpack.
+    'sharp',
+  ],
+  sourcemap: true,
+  jsx: 'automatic',
+  loader: {
+    '.ts': 'ts',
+    '.js': 'js',
+  },
+  plugins: CORE_SMOKE ? [coreSmokePremiumExternalPlugin] : [],
+  // EVAL-ONLY DNS fix, injected at the very top of every output bundle (runs
+  // BEFORE esbuild's deferred __esm module initializers — a top-level statement
+  // inside main.ts gets wrapped in a lazy init that never ran at process start).
+  // Under the real-UI eval's rapid app-relaunch load, macOS getaddrinfo returns
+  // spurious ENOTFOUND for api.natively.software (a Railway CNAME), failing the
+  // app's fetch() to /v1/pro/verify and /v1/chat and corrupting the eval — even
+  // though `dig`/dns.resolve4 resolve it fine. We reroute dns.lookup for that one
+  // host to dns.resolve4 (direct DNS query, no getaddrinfo cache). Gated on
+  // NATIVELY_UI_EVAL='1' and idempotent (__nativelyDnsPinned guard), so it is a
+  // strict no-op in production and across the multiple bundles that carry it.
+  banner: {
+    js: `try{if(process.env.NATIVELY_UI_EVAL==='1'&&!globalThis.__nativelyDnsPinned){globalThis.__nativelyDnsPinned=1;var __dns=require('dns');var __ol=__dns.lookup.bind(__dns);__dns.lookup=function(h,o,cb){if(typeof o==='function'){cb=o;o={};}if(h==='api.natively.software'){return __dns.resolve4(h,function(e,a){if(e||!a||!a.length)return __ol(h,o,cb);if(o&&o.all)return cb(null,[{address:a[0],family:4}]);return cb(null,a[0],4);});}return __ol(h,o,cb);};console.log('[eval] dns.lookup→resolve4 pinned for api.natively.software');}}catch(__e){try{console.warn('[eval] dns pin banner failed:',__e&&__e.message);}catch(_){}}`,
+  },
+  logLevel: 'warning',
+};
+
+const onFailure = (err) => {
+  console.error('[build-electron] Build failed:', err.message);
+  process.exit(1);
+};
+
+// Non-JS assets esbuild does not know about. These must be copied on EVERY
+// build path — a one-off copy in the non-watch branch left `npm run watch`
+// (after a clean) with a dist-electron that has no .proto, so NVIDIA speech
+// died at runtime with an ENOENT pointing at the missing file rather than at
+// the build.
+const ASSETS = [
+  { from: 'electron/audio/riva_asr.proto', to: 'electron/audio/riva_asr.proto' },
+];
+
+const copyAssets = () => {
+  for (const asset of ASSETS) {
+    const src = path.resolve(rootDir, asset.from);
+    const dest = path.resolve(outDir, asset.to);
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    fs.copyFileSync(src, dest);
+  }
+};
+
+if (WATCH) {
+  context(buildOptions).then(async (ctx) => {
+    await ctx.watch();
+    copyAssets();
+    // Deliberately no timing here: ctx.watch() returns once the watcher is armed,
+    // and esbuild runs the first build asynchronously after that — printing an
+    // elapsed time would report context setup, not a completed build.
+    console.log('[build-electron] watching for changes...');
+  }).catch(onFailure);
+} else {
+  if (CORE_SMOKE) {
+    console.log('[build-electron] Core smoke mode: private premium imports are external');
+  }
+  build(buildOptions).then(() => {
+    copyAssets();
+    console.log(`[build-electron] Done in ${Date.now() - start}ms`);
+  }).catch(onFailure);
+}

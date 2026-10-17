@@ -1,0 +1,194 @@
+{
+ "note": "SYNTHETIC: hand-written from the apps' published accessibility labels, not recorded from a call. Replace with a tree recorded by NATIVELY_DUMP_CALL_TREE=1 from a real call on this app and OS.",
+ "app": "zoom",
+ "platform": "darwin",
+ "expect": {
+  "people": [
+   [
+    "Priya Nair",
+    true
+   ],
+   [
+    "Rob Lane",
+    false
+   ]
+  ],
+  "selfNames": [
+   "Evin John"
+  ]
+ },
+ "tree": {
+  "trusted": true,
+  "truncated": false,
+  "elapsedMs": 40,
+  "windows": [
+   {
+    "title": "Zoom Workplace",
+    "nodes": [
+     {
+      "depth": 0,
+      "role": "AXWindow:AXStandardWindow",
+      "name": "Zoom Workplace",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "AXTable",
+      "name": "",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXRow",
+      "name": "",
+      "description": "Dana Ruiz, Available",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXRow",
+      "name": "",
+      "description": "Sam Ortiz, Away",
+      "value": "",
+      "id": ""
+     }
+    ]
+   },
+   {
+    "title": "Zoom Meeting",
+    "nodes": [
+     {
+      "depth": 0,
+      "role": "AXWindow:AXStandardWindow",
+      "name": "Zoom Meeting",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "AXGroup",
+      "name": "",
+      "description": "Video gallery",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXGroup",
+      "name": "",
+      "description": "Evin John (Host, me), Computer audio unmuted, Video on",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXGroup",
+      "name": "",
+      "description": "Priya Nair, Computer audio unmuted, Video on",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 3,
+      "role": "AXImage",
+      "name": "",
+      "description": "Speaking",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXGroup",
+      "name": "",
+      "description": "Rob Lane, Computer audio muted, Video off",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "AXMenuButton",
+      "name": "View",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXMenuItem",
+      "name": "Show active speaker video",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "AXButton",
+      "name": "Mute",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "AXButton",
+      "name": "Participants",
+      "description": "",
+      "value": "",
+      "id": ""
+     }
+    ]
+   },
+   {
+    "title": "Participants (3)",
+    "nodes": [
+     {
+      "depth": 0,
+      "role": "AXWindow:AXFloatingWindow",
+      "name": "Participants (3)",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "AXOutline",
+      "name": "",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXRow",
+      "name": "",
+      "description": "Evin John (Host, me), Computer audio unmuted",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXRow",
+      "name": "",
+      "description": "Priya Nair, Computer audio unmuted",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXRow",
+      "name": "",
+      "description": "Rob Lane, Computer audio muted",
+      "value": "",
+      "id": ""
+     }
+    ]
+   }
+  ]
+ }
+}

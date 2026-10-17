@@ -1,0 +1,27 @@
+# Private, localhost-only installation. manage.mjs generates the secret.
+use_default_settings:
+  engines:
+    # DuckDuckGo passed live relevance checks on this connection. Add other
+    # engines here after testing them; upstream blocking varies by network.
+    keep_only: [duckduckgo]
+general:
+  debug: false
+  instance_name: Natively Search
+search:
+  safe_search: 1
+  autocomplete: ''
+  default_lang: en
+  formats: [html, json]
+server:
+  secret_key: REPLACE_WITH_RANDOM_SECRET
+  limiter: false
+  image_proxy: false
+  public_instance: false
+valkey:
+  url: false
+outgoing:
+  request_timeout: 5.0
+  max_request_timeout: 8.0
+engines:
+  - name: duckduckgo
+    disabled: false

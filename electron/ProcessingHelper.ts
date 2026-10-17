@@ -1,0 +1,329 @@
+// ProcessingHelper.ts
+
+import { AppState } from "./main"
+import { LLMHelper } from "./LLMHelper"
+import { CredentialsManager } from "./services/CredentialsManager"
+import { app } from "electron"
+// import dotenv from "dotenv" // Removed static import
+
+if (!app.isPackaged) {
+  require("dotenv").config()
+}
+
+const isDev = process.env.NODE_ENV === "development"
+const isDevTest = process.env.IS_DEV_TEST === "true"
+const MOCK_API_WAIT_TIME = Number(process.env.MOCK_API_WAIT_TIME) || 500
+
+export class ProcessingHelper {
+  private appState: AppState
+  private llmHelper: LLMHelper
+  private currentProcessingAbortController: AbortController | null = null
+  private currentExtraProcessingAbortController: AbortController | null = null
+
+  constructor(appState: AppState) {
+    this.appState = appState
+
+    // Check if user wants to use Ollama. DEVELOPMENT ONLY, like the key reads
+    // below — see that comment for why a packaged build must not consult
+    // process.env here.
+    const useOllama = !app.isPackaged && process.env.USE_OLLAMA === "true"
+    const ollamaModel = process.env.OLLAMA_MODEL // Don't set default here, let LLMHelper auto-detect
+    const ollamaUrl = process.env.OLLAMA_URL || "http://localhost:11434"
+
+    if (useOllama) {
+      // console.log("[ProcessingHelper] Initializing with Ollama")
+      this.llmHelper = new LLMHelper(undefined, true, ollamaModel, ollamaUrl)
+    } else {
+      // Try environment first — DEVELOPMENT ONLY. A packaged build must not
+      // consult process.env here: loadStoredCredentials() (called right after
+      // app.whenReady(), see main.ts) is the sole source of truth once
+      // CredentialsManager is ready, mirroring the app.isPackaged gate in
+      // CredentialsManager.storedOrEnv. Without this gate, a packaged build
+      // would resurrect a key the user cleared in Settings (CredentialsManager
+      // correctly returns undefined, but the env-derived key set here stays
+      // live because loadStoredCredentials only overrides truthy keys), and on
+      // Windows a stray *_API_KEY inherited from another tool's user-level env
+      // var would silently become an active credential. See
+      // CredentialEnvFallbackScope2026_09_08.test.mjs for the other half of
+      // this bug class.
+      let apiKey = app.isPackaged ? undefined : process.env.GEMINI_API_KEY
+      let groqApiKey = app.isPackaged ? undefined : process.env.GROQ_API_KEY
+      let openaiApiKey = app.isPackaged ? undefined : process.env.OPENAI_API_KEY
+      let claudeApiKey = app.isPackaged ? undefined : process.env.CLAUDE_API_KEY
+      let deepseekApiKey = app.isPackaged ? undefined : process.env.DEEPSEEK_API_KEY
+      let nvidiaNimApiKey = app.isPackaged ? undefined : process.env.NVIDIA_NIM_API_KEY
+
+      // Allow initializing without key (will be loaded in loadStoredCredentials or via Settings)
+      if (!apiKey) {
+        console.warn("[ProcessingHelper] GEMINI_API_KEY not found in env (or running packaged). Will try CredentialsManager after ready.")
+      }
+
+      this.llmHelper = new LLMHelper(apiKey, false, undefined, undefined, groqApiKey, openaiApiKey, claudeApiKey, deepseekApiKey, nvidiaNimApiKey)
+    }
+  }
+
+  /**
+   * Load stored credentials from CredentialsManager
+   * Should be called after app.whenReady() when CredentialsManager is initialized
+   */
+  public loadStoredCredentials(): void {
+    const credManager = CredentialsManager.getInstance();
+
+    const geminiKey = credManager.getGeminiApiKey();
+    const groqKey = credManager.getGroqApiKey();
+    const openaiKey = credManager.getOpenaiApiKey();
+    const claudeKey = credManager.getClaudeApiKey();
+    const deepseekKey = credManager.getDeepseekApiKey();
+    const nvidiaNimKey = credManager.getNvidiaNimApiKey();
+    const openrouterKey = credManager.getOpenrouterApiKey();
+    const fluxionKey = credManager.getFluxionApiKey();
+    const agentrouterKey = credManager.getAgentRouterApiKey();
+
+    if (geminiKey) {
+      console.log("[ProcessingHelper] Loading stored Gemini API Key from CredentialsManager");
+      this.llmHelper.setApiKey(geminiKey);
+    }
+
+    if (groqKey) {
+      console.log("[ProcessingHelper] Loading stored Groq API Key from CredentialsManager");
+      this.llmHelper.setGroqApiKey(groqKey);
+    }
+
+    if (openaiKey) {
+      console.log("[ProcessingHelper] Loading stored OpenAI API Key from CredentialsManager");
+      this.llmHelper.setOpenaiApiKey(openaiKey);
+    }
+
+    if (claudeKey) {
+      console.log("[ProcessingHelper] Loading stored Claude API Key from CredentialsManager");
+      this.llmHelper.setClaudeApiKey(claudeKey);
+    }
+
+    if (deepseekKey) {
+      console.log("[ProcessingHelper] Loading stored DeepSeek API Key from CredentialsManager");
+      this.llmHelper.setDeepseekApiKey(deepseekKey);
+    }
+    if (nvidiaNimKey) this.llmHelper.setNvidiaNimApiKey(nvidiaNimKey);
+    // Hydrated here rather than through the constructor: this ONE key may already
+    // be on disk because the user configured OpenRouter embeddings or reranking,
+    // long before the AI Providers card existed. Loading it at boot is what makes
+    // chat work for them without re-entering anything.
+    if (openrouterKey) this.llmHelper.setOpenrouterApiKey(openrouterKey);
+    // The protocol must be hydrated WITH the key: setFluxionConfig builds one
+    // client per protocol, so passing the key alone would silently rebuild an
+    // 'openai' client for a user whose group is Anthropic and turn every boot
+    // into a wrong-endpoint failure.
+    if (fluxionKey) this.llmHelper.setFluxionConfig(fluxionKey, credManager.getFluxionProtocol());
+    if (agentrouterKey) this.llmHelper.setAgentRouterApiKey(agentrouterKey);
+
+    const litellmBaseURL = credManager.getLitellmBaseURL();
+    if (litellmBaseURL) {
+      console.log("[ProcessingHelper] Loading stored LiteLLM config from CredentialsManager");
+      this.llmHelper.setLitellmConfig(credManager.getLitellmApiKey() || '', litellmBaseURL, credManager.getLitellmMaxTokens());
+    }
+
+    // Without this the client is never constructed at startup, so a user who
+    // configured 9Router in a previous session has a selected model that
+    // dispatches to nothing until they re-save the card.
+    const ninerouterBaseURL = credManager.getNinerouterBaseURL();
+    if (ninerouterBaseURL) {
+      console.log("[ProcessingHelper] Loading stored 9Router config from CredentialsManager");
+      this.llmHelper.setNinerouterConfig(credManager.getNinerouterApiKey() || '', ninerouterBaseURL, credManager.getNinerouterMaxTokens(), credManager.getNinerouterThinking() || null);
+    }
+
+    const nativelyKey = credManager.getNativelyApiKey();
+    if (nativelyKey) {
+      console.log("[ProcessingHelper] Loading stored Natively API Key from CredentialsManager");
+      this.llmHelper.setNativelyKey(nativelyKey);
+    }
+
+    // CRITICAL: Re-initialize IntelligenceManager now that keys are loaded
+    // This fixes the issue where buttons don't work in production because of late key loading
+    this.appState.getIntelligenceManager().initializeLLMs();
+
+    // CRITICAL: Initialize RAGManager (Embeddings) with loaded keys
+    // This fixes "RAG unavailable" in production where process.env is empty
+    const ragManager = this.appState.getRAGManager();
+    if (ragManager) {
+      // buildEmbeddingConfig(), NOT a hand-written object. This used to pass
+      // `{ openaiKey, geminiKey, providerDataScopes }` and nothing else, and it
+      // runs AFTER the correct startup init — so it clobbered that config and
+      // silently dropped nativelyApiKey, ollamaUrl, every model/dims field and,
+      // fatally, the user's embeddingMode/embeddingProvider selection. Settings
+      // could read {mode:'manual', provider:'natively'} while the pipeline
+      // resolved gemini, which is what made choosing a model appear to do
+      // nothing. A hand-maintained field list is the defect; the builder is the
+      // single place that knows how to assemble this.
+      console.log("[ProcessingHelper] Initializing RAGManager embeddings with available keys");
+      const { buildEmbeddingConfig } = require('./rag/embeddingConfigIdentity');
+      ragManager.initializeEmbeddings(buildEmbeddingConfig());
+
+      // CRITICAL: Retry pending embeddings now that we have a key
+      // This ensures any meetings that failed or were queued during startup get processed
+      console.log("[ProcessingHelper] Retrying pending embeddings...");
+      ragManager.retryPendingEmbeddings().catch(console.error);
+
+      // CRITICAL: Ensure demo meeting has chunks
+      ragManager.ensureDemoMeetingProcessed().catch(console.error);
+      // Once per launch: summaries for meetings indexed before their notes existed.
+      ragManager.backfillMeetingSummaries().catch(console.error);
+
+      // CRITICAL: Cleanup stale queue items to prevent "Chunk not found" errors
+      ragManager.cleanupStaleQueueItems();
+    }
+
+    // Initialize self-improving model version manager (background, non-blocking)
+    this.llmHelper.initModelVersionManager().catch(err => {
+      console.warn('[ProcessingHelper] ModelVersionManager initialization failed (non-critical):', err.message);
+    });
+
+    // NEW: Load Default Model Config
+    const defaultModel = credManager.getDefaultModel();
+    // The one-time image test may run from here on (2026-10-01): keys are
+    // hydrated above, and main configured the capability store before this
+    // helper existed. Before the `if`, so a later selection is tested too.
+    this.llmHelper.enableVisionProbing();
+    if (defaultModel) {
+      console.log(`[ProcessingHelper] Loading stored Default Model: ${defaultModel}`);
+      const customProviders = credManager.getCustomProviders();
+      const curlProviders = credManager.getCurlProviders();
+      const allProviders = [...(customProviders || []), ...(curlProviders || [])];
+      this.llmHelper.setModel(defaultModel, allProviders);
+    }
+
+    // Load Languages
+    const sttLanguage = credManager.getSttLanguage();
+    const aiResponseLanguage = credManager.getAiResponseLanguage();
+
+    if (sttLanguage) {
+      this.llmHelper.setSttLanguage(sttLanguage);
+    }
+
+    if (aiResponseLanguage) {
+      this.llmHelper.setAiResponseLanguage(aiResponseLanguage);
+    }
+  }
+
+  public async processScreenshots(): Promise<void> {
+    const mainWindow = this.appState.getMainWindow()
+    if (!mainWindow) return
+
+    const view = this.appState.getView()
+
+    if (view === "queue") {
+      const screenshotQueue = this.appState.getScreenshotHelper().getScreenshotQueue()
+      if (screenshotQueue.length === 0) {
+        mainWindow.webContents.send(this.appState.PROCESSING_EVENTS.NO_SCREENSHOTS)
+        return
+      }
+
+
+
+      const allPaths = this.appState.getScreenshotHelper().getScreenshotQueue();
+
+      mainWindow.webContents.send(this.appState.PROCESSING_EVENTS.INITIAL_START)
+      this.appState.setView("solutions")
+      this.currentProcessingAbortController = new AbortController()
+      try {
+        // Generate the structured 4-phase rolling interview script
+        const rollingScript = await this.llmHelper.generateRollingScript(allPaths);
+
+        const problemInfo = {
+          problem_statement: rollingScript.problem_identifier_script,
+          input_format: { description: "Generated from screenshot", parameters: [] as any[] },
+          output_format: { description: "Generated from screenshot", type: "string", subtype: "structured" },
+          complexity: { time: rollingScript.time_complexity, space: rollingScript.space_complexity },
+          test_cases: [] as any[],
+          validation_type: "structured",
+          difficulty: "custom"
+        };
+        mainWindow.webContents.send(this.appState.PROCESSING_EVENTS.PROBLEM_EXTRACTED, problemInfo);
+        this.appState.setProblemInfo(problemInfo);
+
+        // Send the full structured solution so Solutions.tsx renders the 4 phases
+        mainWindow.webContents.send(this.appState.PROCESSING_EVENTS.SOLUTION_SUCCESS, {
+          solution: {
+            problem_identifier_script: rollingScript.problem_identifier_script,
+            brainstorm_script: rollingScript.brainstorm_script,
+            code: rollingScript.code,
+            dry_run_script: rollingScript.dry_run_script,
+            time_complexity: rollingScript.time_complexity,
+            space_complexity: rollingScript.space_complexity,
+          }
+        });
+      } catch (error: any) {
+        console.error("[ProcessingHelper] Rolling script generation failed:", error);
+        mainWindow.webContents.send(this.appState.PROCESSING_EVENTS.INITIAL_SOLUTION_ERROR, error.message)
+      } finally {
+        this.currentProcessingAbortController = null
+      }
+      return;
+
+    } else {
+      // Debug mode
+      const extraScreenshotQueue = this.appState.getScreenshotHelper().getExtraScreenshotQueue()
+      if (extraScreenshotQueue.length === 0) {
+        // console.log("No extra screenshots to process")
+        mainWindow.webContents.send(this.appState.PROCESSING_EVENTS.NO_SCREENSHOTS)
+        return
+      }
+
+      mainWindow.webContents.send(this.appState.PROCESSING_EVENTS.DEBUG_START)
+      this.currentExtraProcessingAbortController = new AbortController()
+
+      try {
+        // Get problem info and current solution
+        const problemInfo = this.appState.getProblemInfo()
+        if (!problemInfo) {
+          throw new Error("No problem info available")
+        }
+
+        // Get current solution from state
+        const currentSolution = await this.llmHelper.generateSolution(problemInfo)
+        const currentCode = currentSolution.solution.code
+
+        // Debug the solution using vision model
+        const debugResult = await this.llmHelper.debugSolutionWithImages(
+          problemInfo,
+          currentCode,
+          extraScreenshotQueue
+        )
+
+        this.appState.setHasDebugged(true)
+        mainWindow.webContents.send(
+          this.appState.PROCESSING_EVENTS.DEBUG_SUCCESS,
+          debugResult
+        )
+
+      } catch (error: any) {
+        // console.error("Debug processing error:", error)
+        mainWindow.webContents.send(
+          this.appState.PROCESSING_EVENTS.DEBUG_ERROR,
+          error.message
+        )
+      } finally {
+        this.currentExtraProcessingAbortController = null
+      }
+    }
+  }
+
+  public cancelOngoingRequests(): void {
+    if (this.currentProcessingAbortController) {
+      this.currentProcessingAbortController.abort()
+      this.currentProcessingAbortController = null
+    }
+
+    if (this.currentExtraProcessingAbortController) {
+      this.currentExtraProcessingAbortController.abort()
+      this.currentExtraProcessingAbortController = null
+    }
+
+    this.appState.setHasDebugged(false)
+  }
+
+
+
+  public getLLMHelper() {
+    return this.llmHelper;
+  }
+}

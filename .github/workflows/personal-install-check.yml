@@ -1,0 +1,31 @@
+name: Personal source install checks
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  public-source:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      NATIVELY_CORE_SMOKE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run test:setup
+      - run: npm run typecheck:ts7
+      - run: npm run typecheck:electron
+      - run: npm run build:native
+      - run: npm run build
+      - run: npm run test:knowledge

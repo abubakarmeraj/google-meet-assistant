@@ -1,0 +1,34 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["DOM", "DOM.Iterable", "ESNext"], // Browser APIs
+    "module": "ESNext", // For Vite/Modern browsers
+    "moduleResolution": "bundler", // For Vite
+    "jsx": "react-jsx", // React specific
+    "noEmit": true, // Vite handles the building
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "strict": true,
+    "noUnusedLocals": false,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    // TypeScript 7 no longer auto-includes every visible @types/* package, so the
+    // set has to be named explicitly (it was implicit under TS <=6).
+    //   node                    -> `process` + the NodeJS.* namespace
+    //   react-syntax-highlighter -> react-syntax-highlighter@16 ships NO .d.ts of its
+    //     own; the deep `dist/esm/*` imports are typed solely by the ambient
+    //     `declare module` blocks inside @types/react-syntax-highlighter@15.
+    // Types reached through `import` (react,
+    // react-dom, ws, three, ...) resolve normally and do not belong here.
+    "types": ["node", "react-syntax-highlighter"],
+    "paths": {
+      "@/*": ["./src/*"],
+      "@hooks/*": ["./src/hooks/*"],
+      "@config/*": ["./src/config/*"]
+    }
+  },
+  "include": ["src", "premium/src"], // React source files and optional premium components
+  "references": [{ "path": "./tsconfig.node.json" }]
+}

@@ -1,0 +1,112 @@
+{
+ "note": "SYNTHETIC: hand-written from the apps' published accessibility labels, not recorded from a call. Replace with a tree recorded by NATIVELY_DUMP_CALL_TREE=1 from a real call on this app and OS.",
+ "app": "teams",
+ "platform": "darwin",
+ "expect": {
+  "people": [
+   [
+    "Priya Nair",
+    false
+   ],
+   [
+    "Rob Lane",
+    true
+   ]
+  ],
+  "selfNames": [
+   "Evin John"
+  ]
+ },
+ "tree": {
+  "trusted": true,
+  "truncated": false,
+  "elapsedMs": 60,
+  "windows": [
+   {
+    "title": "Meeting with Priya Nair | Microsoft Teams",
+    "nodes": [
+     {
+      "depth": 0,
+      "role": "AXWindow:AXStandardWindow",
+      "name": "Meeting with Priya Nair | Microsoft Teams",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "AXWebArea",
+      "name": "",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXGroup",
+      "name": "Evin John (You), Unmuted, Video on",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXGroup",
+      "name": "Priya Nair, Muted, Video off",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXGroup",
+      "name": "Rob Lane",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 3,
+      "role": "AXStaticText",
+      "name": "",
+      "description": "",
+      "value": "Rob Lane",
+      "id": ""
+     },
+     {
+      "depth": 3,
+      "role": "AXImage",
+      "name": "",
+      "description": "Speaking",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXButton",
+      "name": "Raise hand",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "AXList",
+      "name": "Chat",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 3,
+      "role": "AXGroup",
+      "name": "Priya Nair, 10:02, can everyone see my screen",
+      "description": "",
+      "value": "",
+      "id": ""
+     }
+    ]
+   }
+  ]
+ }
+}

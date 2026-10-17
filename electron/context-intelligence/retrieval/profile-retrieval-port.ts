@@ -1,0 +1,1044 @@
+// electron/context-intelligence/retrieval/profile-retrieval-port.ts
+//
+// THE factory for a RetrievalPort over the user's PROFILE INTELLIGENCE sources
+// (active résumé + active target JD + verified profile facts).
+//
+// WHY THIS EXISTS (2026-07-31 source-routing defect)
+// The planner has always been able to PLAN [RESUME, PROFILE_FACT,
+// JOB_DESCRIPTION] — but planned types are a FILTER on whatever pool the turn's
+// ports expose, and the only private-source port was the mode port over
+// mode-attached files. A Looking-for-Work turn with zero attachments therefore
+// resolved RESUME to an empty pool and told the user to upload a résumé they
+// had already processed through Profile Intelligence. Mode attachments are
+// SUPPLEMENTS; this port makes the profile the primary pool the spec says it is.
+//
+// Same construction rules as the mode/meeting ports:
+//   * everything injected structurally — no import of ProfilePackBuilder,
+//     KnowledgeOrchestrator or any legacy module, so this stays testable without
+//     Electron or a DB. Callers collect the data (see
+//     electron/services/knowledge/v3ProfileSources.ts) and hand it in as values.
+//   * fail-closed registry: every source gets a DECLARED type, version and
+//     scope; a doc whose mapped type the mode does not AUTHORIZE FOR PROFILE
+//     HYDRATION (policy.profileSources) is not registered at all.
+//   * the shared legacy-retrieval-port applies planned-type + claim-authority
+//     gates downstream — this port only decides what exists and how it ranks.
+//
+// WHY SECTIONS FROM structured_data AND NOT ONLY OKF CARDS
+// Verified live: ProfilePackBuilder.buildSourceText / the card templates drop
+// `compensation_hint` and `min_years_experience`, so the JD's salary band and
+// experience bar exist in knowledge_documents.structured_data but in NO card.
+// Sections are rendered deterministically from the structured extraction every
+// turn — complete, fresh (no pack-staleness window), and versioned by the
+// caller-supplied content hash. Cards ride along as verified summaries (they
+// carry AOT artifacts the raw extraction does not).
+
+import type { EvidenceScope, SourceType } from '../contracts/types';
+import type { RetrievalPort } from '../orchestration/orchestrator';
+import { createLegacyRetrievalPort } from './legacy-retrieval-port';
+import type { LegacyChunk } from './legacy-adapter';
+import { Bm25Index, DEFAULT_BM25 } from './bm25';
+// Pure tokenizer/statistics module — no Electron, no DB — so the rule above holds.
+import { buildLexicalStats, anchoringChunkIndexes, anchorTerms, anchorCoverage, questionContentWords, PROBE_MIN_COVERAGE, PROBE_MIN_ANCHORS } from '../../services/modes/lexicalTokens';
+import { semanticChunks } from '../../services/modes/semanticChunker';
+import { stripUnsupportedDerivedResumeFields, isGeneratedArtifactCard, isExtractorPlaceholder, buildSupportIndex, assessDerivedSupport, unsupportedExperienceEntries } from './profile-derived-support';
+
+/**
+ * 'fact' (2026-08-02) carries DERIVED profile facts — things the app computed
+ * about the user that no uploaded document states. It exists because
+ * PROFILE_FACT was a planned source type with a structurally empty pool: the
+ * planner emitted [RESUME, PROFILE_FACT] for "what is my expected salary", the
+ * résumé is silent on the subject by nature, and PROFILE_FACT resolved to
+ * nothing — so the turn answered DOCUMENT_FACT_NOT_FOUND about a figure
+ * SalaryIntelligence had already computed and logged.
+ *
+ * Since 2026-10-14 the kind carries what the USER wrote or approved about
+ * themselves ("Cue Cards": structured.ownAnswers), and nothing derived; see
+ * renderFactSections.
+ */
+export type ProfileDocKind = 'resume' | 'jd' | 'fact';
+
+export interface ProfileCardLike {
+  id: string;
+  type?: string;
+  title: string;
+  body: string;
+  approvalStatus?: string;
+  /** OKF provenance ('structured_profile' | 'aot_artifact' | …). An
+   *  'aot_artifact' card is model-composed and never served as evidence. */
+  generatedFrom?: string;
+}
+
+export interface ProfileDocLike {
+  kind: ProfileDocKind;
+  /** Canonical stable id (the OKF psrc_* derivation) — appears in telemetry and
+   *  the evidence manifest, so it must match what the DB calls the source. */
+  sourceId: string;
+  /** Content hash of the structured extraction. A profile re-upload changes it,
+   *  which is what makes "replace the résumé, ask again, get the new facts"
+   *  work without restarting anything: the port is rebuilt per turn. */
+  versionId: string;
+  fileName: string;
+  /** StructuredResume | StructuredJD — treated as data, never trusted shape. */
+  structured: Record<string, unknown> | null | undefined;
+  /** OKF verified cards for this doc, if a pack exists. Optional. */
+  cards?: ProfileCardLike[];
+  /**
+   * The document's RAW parsed text (deep-test D1, 2026-08-01). The structured
+   * extraction is inherently lossy — anything without a schema slot (a canary
+   * line, a 7-stage interview list, arbitrary metrics) was unretrievable
+   * forever. Raw text is chunked into additional sections so every fact the
+   * document states remains reachable; the structured sections stay as the
+   * higher-precision ranking aid. Optional: absent for legacy rows until the
+   * caller can supply it.
+   */
+  rawText?: string | null;
+}
+
+export interface ProfilePortInput {
+  docs: ProfileDocLike[];
+  /** policy.allowedSourceTypes — a profile doc whose mapped type the mode does
+   *  not allow at all is never registered. */
+  allowedSourceTypes: readonly SourceType[];
+  /**
+   * policy.profileSources — the mode's EXPLICIT opt-in to profile hydration.
+   * Distinct from allowedSourceTypes on purpose: Recruiting allows
+   * JOB_DESCRIPTION (a hiring JD attached to the mode) but must NEVER hydrate
+   * the user's own target JD into candidate evaluation. Empty ⇒ this factory
+   * returns null and the turn sees no profile sources.
+   */
+  profileSources: readonly SourceType[];
+  /** MUST match the userId on the turn's scope, or containment rejects all. */
+  userId: string;
+  /**
+   * Content hashes of mode-attached files (sha256 hex of raw content). A
+   * profile doc whose EXTRACTION hash cannot match a raw-file hash is not
+   * deduplicated this way — this exists for the caller that CAN compute a
+   * matching identity (same canonical document attached to the mode), so the
+   * duplicate is served once, from the mode attachment it was compared against.
+   */
+  excludeVersionIds?: readonly string[];
+  /**
+   * SEMANTIC ARM for the raw document text (2026-09-20, owner-approved design:
+   * experiments/retrieval-scale/PI-VECTOR-ARM-DESIGN.md). This port ranks with BM25
+   * only, so a paraphrase with no shared vocabulary ("How senior do I need to be?"
+   * vs "9+ years building distributed backend systems") had no route to its chunk
+   * — live, those misses came back as WRONG answers, not refusals. The callers bind
+   * this to the mode retriever's index over the same raw text (hybrid lexical +
+   * vector + rerank), so there is one vector stack, not two. Returned chunks carry
+   * the PROFILE document's sourceId. Absent, throwing or empty ⇒ the BM25 raw
+   * chunks are used exactly as before.
+   */
+  rawRetriever?: (query: string, opts: { topK: number; timeoutMs?: number }) => Promise<RawRetrievedChunk[]>;
+  /** false keeps passages even for a profile that fits (PROFILE_WHOLE_MAX_TOKENS). Default: whole. */
+  wholeDocuments?: boolean;
+}
+
+export interface RawRetrievedChunk {
+  /** The ProfileDocLike.sourceId this text came from — NOT the index's pseudo-file id. */
+  sourceId: string;
+  text: string;
+  chunkIndex: number;
+  /** Hybrid / rerank score; clamped into [0, 1] here. */
+  score: number;
+}
+
+const TYPE_FOR_KIND: Record<ProfileDocKind, SourceType> = {
+  resume: 'RESUME',
+  jd: 'JOB_DESCRIPTION',
+  fact: 'PROFILE_FACT',
+};
+
+// ── A PROFILE THAT FITS THE PROMPT IS HANDED OVER WHOLE (2026-10-03) ─────────
+//
+// Measured on the evidence-rich benchmark, with a 1,048-word résumé and a
+// 760-word job description loaded through Profile Intelligence: a turn carries
+// at most six profile passages out of about seventy, and of the rows whose
+// answer rests on a résumé or JD fact, every needed fact was in the prompt on
+// 13 of 33. With it there the answers scored 9.5, without it 6.6 ("I'll confirm
+// the before-and-after figures and come back to you", from a candidate whose
+// résumé states them). The two documents together are about 2,700 tokens.
+//
+// So when every registered résumé / JD has its raw text and together they fit
+// this size, a turn that reads the profile gets each PLANNED document as one
+// item holding its whole text, in place of that document's raw-text passages
+// and the semantic arm (no embed / rerank round trip). What does not change:
+// structured sections, cards, the complete-inventory sections that license
+// "X is not listed", derived facts, the planned-type gate (a turn that plans
+// only the résumé still gets no JD), and a larger profile, which keeps
+// retrieval exactly as it was. The plan makes the room (orchestrator.decide).
+//
+// 6,000 tokens: about ten pages of the two documents, and small enough that a
+// full reference pack (mode-retrieval-port WHOLE_PACK_MAX_TOKENS) plus the
+// profile stays under what the claim pass is shown
+// (llm/claimVerifier CLAIM_VERIFIER_MATERIAL_MAX_CHARS); a test holds the
+// three figures to that relation.
+/** Whole-profile threshold, in the packer's estimateTokens units (~4 chars/token). */
+export const PROFILE_WHOLE_MAX_TOKENS = 6000;
+/** The `section` of a whole-document item. */
+export const PROFILE_WHOLE_SECTION = 'Document (whole)';
+
+/**
+ * Size and count of the profile documents a mode would be handed whole, or null
+ * when they are not (a document without raw text, too large, none authorized).
+ * The callers pass it to the plan; the port applies the same rule to itself.
+ *
+ * The user's own answers are sized apart and reported even when the résumé and
+ * the job description are not handed over whole, or are absent: they go whole
+ * on their own (`{ tokens: 0, docs: 0, answersTokens }`).
+ */
+export function profileWholeInfo(
+  docs: ReadonlyArray<Pick<ProfileDocLike, 'kind' | 'sourceId' | 'versionId' | 'rawText'> & { structured?: ProfileDocLike['structured'] }>,
+  allowedSourceTypes: readonly SourceType[],
+  profileSources: readonly SourceType[],
+): { tokens: number; docs: number; answersTokens?: number } | null {
+  const authorized = new Set<SourceType>((profileSources ?? []).filter((t) => (allowedSourceTypes ?? []).includes(t)));
+  let tokens = 0; let count = 0; let answersTokens = 0; let sizeUnknown = false;
+  for (const doc of docs ?? []) {
+    // The user's own answers are one more whole item. Their size is reported
+    // apart: it is room the plan adds, never part of the question "do the résumé
+    // and the job description fit".
+    if (doc.kind === 'fact') {
+      if (!authorized.has('PROFILE_FACT') || !doc.sourceId || !doc.versionId) continue;
+      const own = ownAnswersWholeText(doc.structured);
+      if (own) answersTokens += Math.ceil(own.length / 4);
+      continue;
+    }
+    if (doc.kind !== 'resume' && doc.kind !== 'jd') continue;
+    if (!authorized.has(TYPE_FOR_KIND[doc.kind]) || !doc.sourceId || !doc.versionId) continue;
+    const raw = typeof doc.rawText === 'string' ? doc.rawText.trim() : '';
+    if (!raw) { sizeUnknown = true; continue; }                 // size unknown: retrieval as before
+    tokens += Math.ceil(raw.length / 4);
+    count += 1;
+  }
+  const fits = !sizeUnknown && count > 0 && tokens <= PROFILE_WHOLE_MAX_TOKENS;
+  if (!fits) return answersTokens > 0 ? { tokens: 0, docs: 0, answersTokens } : null;
+  return answersTokens > 0 ? { tokens, docs: count, answersTokens } : { tokens, docs: count };
+}
+
+// ── deterministic section rendering ─────────────────────────────────────────
+
+export interface ProfileSection {
+  section: string;
+  text: string;
+  /**
+   * TRUE only when the section enumerates the COMPLETE extracted record of a
+   * category (every skill, every employer, every requirement). That is what
+   * licenses grounded NEGATIVE answers: "Kubernetes is not listed" is a fact
+   * about a complete inventory and a guess about a fragment. Consumed by
+   * evidenceSupportsClaim via chunk metadata.
+   */
+  completeInventory: boolean;
+  /**
+   * WHICH category this is the complete record of. Consumed by
+   * evidenceSupportsClaim so the term-free absence shortcut is
+   * category-matched: the complete EMPLOYMENT list must never license a
+   * grounded negative about CERTIFICATIONS (review finding, 2026-07-31 — a
+   * category-blind shortcut manufactured confidently-wrong absences from
+   * whichever complete chunk happened to rank).
+   */
+  inventoryCategory?: string;
+  /** Coarse kind used by the intent boosts below. */
+  boostKey: string;
+}
+
+const str = (v: unknown): string => (typeof v === 'string' ? v.trim() : '');
+const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
+const lines = (v: unknown): string[] => arr(v).map((x) => str(x)).filter(Boolean);
+
+function renderResumeSections(sd: Record<string, unknown>): ProfileSection[] {
+  const out: ProfileSection[] = [];
+  const id = (sd.identity ?? {}) as Record<string, unknown>;
+
+  // FIELD-LABELLED, and contact fields included (2026-08-02 defect).
+  //
+  // Two bugs lived in the previous one-liner
+  // (`[name, summary, location].join('. ')`), both verified against the real
+  // shipped DB:
+  //
+  //  1. UNRETRIEVABLE BY ITS OWN QUESTION. This port ranks by BM25 over
+  //     `section + text`, and the text held only the VALUES ("Rohan Varma.
+  //     Kochi, India") — never the word "name". "What is my name" therefore
+  //     scored 0 on every chunk, fell under the `score > 0.05` cut, and the
+  //     turn logged `evidence:0 / answerability:NONE /
+  //     DOCUMENT_FACT_NOT_FOUND` — the assistant denying a résumé it had
+  //     successfully ingested. Labelling puts the interrogative's own noun in
+  //     the chunk, so the lookup matches lexically instead of relying on a
+  //     boost. (The boost in INTENT_RULES is the belt to this braces.)
+  //
+  //  2. DROPPED FIELDS. email / phone / linkedin / github / website are
+  //     extracted and stored, and NO renderer read them — the same
+  //     extracted-but-invisible class as the `leadership` defect above. A
+  //     résumé stating an email could never answer "what is my email".
+  //
+  // Still NOT an inventory: a contact blurb enumerates nothing, so it must
+  // never license a term-free absence claim (review finding).
+  const identityBits = [
+    str(id.name) ? `Name: ${str(id.name)}` : '',
+    str(id.email) ? `Email: ${str(id.email)}` : '',
+    str(id.phone) ? `Phone: ${str(id.phone)}` : '',
+    str(id.location) ? `Location: ${str(id.location)}` : '',
+    str(id.linkedin) ? `LinkedIn: ${str(id.linkedin)}` : '',
+    str(id.github) ? `GitHub: ${str(id.github)}` : '',
+    str(id.website) ? `Website: ${str(id.website)}` : '',
+    str(id.summary) ? `Summary: ${str(id.summary)}` : '',
+  ].filter(Boolean);
+  if (identityBits.length) {
+    out.push({
+      section: 'Identity & summary', boostKey: 'identity',
+      text: identityBits.join('. '), completeInventory: false,
+    });
+  }
+
+  const exp = arr(sd.experience) as Array<Record<string, unknown>>;
+  for (const e of exp) {
+    const head = [str(e.role), str(e.company)].filter(Boolean).join(' at ');
+    const dates = [str(e.start_date), str(e.end_date)].filter(Boolean).join(' to ');
+    const bullets = lines(e.bullets).join(' ');
+    const text = [head, dates ? `(${dates})` : '', bullets].filter(Boolean).join(' — ');
+    if (text) out.push({ section: `Experience: ${head || 'entry'}`, boostKey: 'experience', text, completeInventory: false });
+  }
+  if (exp.length) {
+    // The complete employment index in ONE chunk: absence semantics need the
+    // full list ("Did I work at Google?" must see every employer to say no).
+    const index = exp.map((e) => {
+      const head = [str(e.role), str(e.company)].filter(Boolean).join(' at ');
+      const dates = [str(e.start_date), str(e.end_date)].filter(Boolean).join(' to ');
+      return dates ? `${head} (${dates})` : head;
+    }).filter(Boolean).join('; ');
+    if (index) {
+      out.push({
+        section: 'Complete employment history', boostKey: 'experience',
+        text: `Complete list of all work experience on the résumé: ${index}. No other employment is listed.`,
+        completeInventory: true, inventoryCategory: 'experience',
+      });
+    }
+  }
+
+  const projects = arr(sd.projects) as Array<Record<string, unknown>>;
+  for (const p of projects) {
+    const tech = lines(p.technologies).join(', ');
+    // `highlights` are the extractor's VERBATIM metric bullets ("Reached 27,450
+    // registered users") — the schema exists precisely so numbers are never
+    // lost, and StructuredExtractor's prompt promises as much. This renderer
+    // dropped them (deep-test D1, 2026-08-01): the model saw a project's name
+    // and stack but none of its metrics, and fabricated the numbers.
+    const highlights = lines(p.highlights).join(' ');
+    const text = [str(p.name), str(p.description), highlights, tech ? `Technologies: ${tech}` : '']
+      .filter(Boolean).join(' — ');
+    if (text) out.push({ section: `Project: ${str(p.name) || 'entry'}`, boostKey: 'projects', text, completeInventory: false });
+  }
+  if (projects.length) {
+    const index = projects.map((p) => str(p.name)).filter(Boolean).join('; ');
+    if (index) {
+      out.push({
+        section: 'Complete project list', boostKey: 'projects',
+        text: `Complete list of all projects on the résumé: ${index}. No other projects are listed.`,
+        completeInventory: true, inventoryCategory: 'projects',
+      });
+    }
+  }
+
+  // Skills: the single most absence-sensitive category. skills_flat (when the
+  // extractor provides it) plus the categorized map, in one complete chunk.
+  const skills = (sd.skills ?? {}) as Record<string, unknown>;
+  const flat = lines(sd.skills_flat);
+  const catLines = Object.entries(skills)
+    .map(([cat, list]) => {
+      const ls = lines(list);
+      return ls.length ? `${cat}: ${ls.join(', ')}` : '';
+    })
+    .filter(Boolean);
+  if (flat.length || catLines.length) {
+    const body = catLines.length ? catLines.join('. ') : flat.join(', ');
+    out.push({
+      section: 'Complete skills inventory', boostKey: 'skills',
+      text: `Complete list of all skills, languages, frameworks and tools on the résumé: ${body}. `
+        + 'Any skill or technology not in this list is not listed on the résumé.',
+      completeInventory: true, inventoryCategory: 'skills',
+    });
+  }
+
+  const education = arr(sd.education) as Array<Record<string, unknown>>;
+  if (education.length) {
+    const body = education.map((ed) => [
+      [str(ed.degree), str(ed.field)].filter(Boolean).join(' in '),
+      str(ed.institution),
+      str(ed.gpa) ? `CGPA/GPA: ${str(ed.gpa)}` : '',
+      [str(ed.start_date), str(ed.end_date)].filter(Boolean).join(' to '),
+    ].filter(Boolean).join(', ')).join('; ');
+    if (body) out.push({ section: 'Education', boostKey: 'education', text: `Complete education record: ${body}`, completeInventory: true, inventoryCategory: 'education' });
+  }
+
+  const achievements = arr(sd.achievements) as Array<Record<string, unknown>>;
+  const achBody = achievements.map((a) => [str(a.title), str(a.description)].filter(Boolean).join(': ')).filter(Boolean).join('; ');
+  if (achBody) out.push({ section: 'Achievements', boostKey: 'achievements', text: achBody, completeInventory: false });
+
+  const certs = lines(sd.certifications).join('; ');
+  if (certs) out.push({ section: 'Certifications', boostKey: 'skills', text: `Certifications: ${certs}`, completeInventory: false });
+
+  // Leadership had ZERO readers in this renderer (deep-test D1) — extracted,
+  // stored, and invisible at answer time.
+  const leadership = arr(sd.leadership) as Array<Record<string, unknown> | string>;
+  const leadBody = leadership.map((l) => (typeof l === 'string'
+    ? l.trim()
+    : [str((l as Record<string, unknown>).title), str((l as Record<string, unknown>).description)].filter(Boolean).join(': ')))
+    .filter(Boolean).join('; ');
+  if (leadBody) out.push({ section: 'Leadership', boostKey: 'experience', text: `Leadership: ${leadBody}`, completeInventory: false });
+
+  return out;
+}
+
+function renderJdSections(sd: Record<string, unknown>): ProfileSection[] {
+  const out: ProfileSection[] = [];
+
+  // Extractor placeholders ("Unknown Role", "Unknown Location") are not in the
+  // job description; rendering them made the app's default read as a JD fact.
+  const real = (v: unknown): string => (isExtractorPlaceholder(v) ? '' : str(v));
+  const role = [
+    real(sd.title), str(sd.company), real(sd.location),
+    str(sd.level) ? `Level: ${str(sd.level)}` : '',
+    str(sd.employment_type) ? `Employment type: ${str(sd.employment_type)}` : '',
+    str(sd.description_summary),
+  ].filter(Boolean).join('. ');
+  if (role) out.push({ section: 'Target role', boostKey: 'role', text: role, completeInventory: false });
+
+  const reqs = lines(sd.requirements);
+  if (reqs.length) {
+    out.push({
+      section: 'Job requirements (complete)', boostKey: 'requirements',
+      text: `Complete list of requirements in the job description: ${reqs.join('; ')}.`,
+      completeInventory: true, inventoryCategory: 'requirements',
+    });
+  }
+  const nice = lines(sd.nice_to_haves);
+  if (nice.length) {
+    out.push({
+      section: 'Nice-to-haves (complete)', boostKey: 'requirements',
+      text: `Complete list of preferred/nice-to-have qualifications: ${nice.join('; ')}.`,
+      completeInventory: true, inventoryCategory: 'nice_to_haves',
+    });
+  }
+  const resp = lines(sd.responsibilities);
+  if (resp.length) {
+    out.push({ section: 'Responsibilities', boostKey: 'role', text: resp.join('; '), completeInventory: false });
+  }
+
+  // The fields the OKF card templates DROP — the reason sections exist at all.
+  const minYears = sd.min_years_experience;
+  const comp = str(sd.compensation_hint);
+  const compBits = [
+    comp ? `Compensation: ${comp}` : '',
+    (typeof minYears === 'number' && minYears > 0)
+      ? `Minimum professional experience required: ${minYears}+ years`
+      : '',
+  ].filter(Boolean);
+  if (compBits.length) {
+    out.push({
+      // Retrievable by term match; not an inventory that grounds absences.
+      section: 'Compensation & experience bar', boostKey: 'compensation',
+      text: compBits.join('. '), completeInventory: false,
+    });
+  }
+
+  const tech = [...lines(sd.technologies), ...lines(sd.keywords)];
+  if (tech.length) {
+    out.push({
+      // Category 'technologies', NOT 'requirements': a keyword list ranking in
+      // must not term-free-support a requirements claim while the actual
+      // requirements chunk went unretrieved (review finding: the clearance case).
+      section: 'Technologies & keywords (complete)', boostKey: 'requirements',
+      text: `Complete list of technologies and keywords named by the job description: ${[...new Set(tech)].join(', ')}.`,
+      completeInventory: true, inventoryCategory: 'technologies',
+    });
+  }
+  return out;
+}
+
+/**
+ * Profile FACTS (kind 'fact' → PROFILE_FACT): things the user stated or
+ * verified about themselves that no uploaded document holds.
+ *
+ * The résumé-based salary ESTIMATE rendered here from 2026-08-02 to 2026-09-30
+ * and is refused by design, even if a caller still hands it in: it is a
+ * model's market estimate for a role and location, not the candidate's
+ * expectation, and PROFILE_FACT carries first-person authority (USER_* claims).
+ * Served as evidence, the model stated the estimate as the user's own figure.
+ *
+ * THE USER'S OWN ANSWERS (2026-10-14) are the one fact type. "What is your
+ * biggest weakness?" with only a résumé loaded had no source: one pass either
+ * invented a weakness or deferred ("let me come back to you"), and no prompt
+ * wording changed that. Profile Intelligence now holds what the user wrote or
+ * approved for such questions (services/knowledge/ownAnswers.ts), handed in as
+ * `structured.ownAnswers`. One section per answer; never a completeInventory
+ * (an answer enumerates nothing). Anything else in a fact document renders
+ * nothing, as before.
+ */
+export const OWN_ANSWERS_BOOST_KEY = 'own_answer';
+const OWN_ANSWERS_INTRO = 'What the user wrote about themselves, in their own words. Each entry is the user\'s own statement and may be said as theirs.';
+// An entry the user accepted from Natively's draft without changing a word (ownAnswers.ts `origin`). It was written
+// from the résumé alone, so where the user's own notes or files answer the same question, those are what they said.
+// 2026-10-15 benchmark: served as "the user's own answer", an accepted draft replaced the reasons for leaving and the
+// weakness the user's notes give, on 3 of 30 Looking for work questions.
+const DRAFTED_MARK = 'A suggested answer drafted from the résumé, which the user accepted without changing it';
+
+function ownAnswerEntries(structured: unknown): Array<{ label: string; heading: string; text: string; drafted: boolean }> {
+  if (!structured || typeof structured !== 'object') return [];
+  return arr((structured as Record<string, unknown>).ownAnswers)
+    .map((a) => {
+      const r = (a ?? {}) as Record<string, unknown>;
+      const label = str(r.label);
+      // How the question is put aloud rides with the label: "Salary expectation"
+      // shares no word with "what are you looking for in base?".
+      const askedAs = str(r.askedAs);
+      return { label, heading: askedAs ? `${label} (asked as: ${askedAs})` : label, text: str(r.text), drafted: r.origin === 'drafted' };
+    })
+    .filter((a) => a.label && a.text);
+}
+
+/** The user's own answers as ONE item, for a turn that reads the profile whole. Empty when there are none. */
+export function ownAnswersWholeText(structured: unknown): string {
+  const entries = ownAnswerEntries(structured);
+  if (entries.length === 0) return '';
+  return [OWN_ANSWERS_INTRO, ...entries.map((a) => `${a.heading}${a.drafted ? ` [${DRAFTED_MARK}]` : ''}:\n${a.text}`)].join('\n\n');
+}
+
+function renderFactSections(sd: Record<string, unknown>): ProfileSection[] {
+  return ownAnswerEntries(sd).map((a) => ({
+    section: `Own answer: ${a.label}`,
+    text: a.drafted ? `${a.heading}. ${DRAFTED_MARK}: ${a.text}` : `${a.heading}. The user's own answer, in their words: ${a.text}`,
+    completeInventory: false,
+    boostKey: OWN_ANSWERS_BOOST_KEY,
+  }));
+}
+
+export function renderProfileSections(kind: ProfileDocKind, structured: unknown): ProfileSection[] {
+  if (!structured || typeof structured !== 'object') return [];
+  try {
+    if (kind === 'resume') return renderResumeSections(structured as Record<string, unknown>);
+    if (kind === 'fact') return renderFactSections(structured as Record<string, unknown>);
+    return renderJdSections(structured as Record<string, unknown>);
+  } catch {
+    return []; // a malformed extraction yields no sections, never a throw
+  }
+}
+
+// ── ranking ─────────────────────────────────────────────────────────────────
+//
+// Lexical BM25 over sections + cards, plus small deterministic intent boosts —
+// the profile analogue of OkfProfileRetriever's INTENT_TYPE_BOOSTS: "Do I have
+// Kubernetes experience?" shares no token with a skills list that (correctly)
+// lacks Kubernetes, so the very chunk that PROVES the absence would never rank.
+// Boosts are additive and small; a genuine lexical match always outranks them.
+
+interface IntentRule { re: RegExp; boosts: Record<string, number> }
+
+const INTENT_RULES: IntentRule[] = [
+  { re: /\b(do i (have|know)|have i (used|worked)|am i (familiar|proficient|experienced)|experience (with|in|using)|missing|not list|do(n'?| no)t (have|know|list)|lack\b|gaps?\b)/i,
+    boosts: { skills: 0.4, requirements: 0.3 } },
+  { re: /\b(gpa|cgpa|degree|educat\w*|universit\w*|college|graduat\w*|studied|study)\b/i,
+    boosts: { education: 0.45 } },
+  // Equity IS compensation (2026-09-19): "How much ownership of the company comes with the
+  // offer?" fired this rule on "offer" and still missed "New-hire equity grants … vesting over four
+  // years", because no equity word was in the class the raw-text boost matches against.
+  // NOT "ownership" / "shares" / bare "stock": résumés say "took ownership of", "shares
+  // knowledge", "in stock" — measured: with "ownership" in the class it matched over a quarter of
+  // the raw chunks, the discriminative cap switched the rule off, and the SALARY fix was lost too.
+  { re: /\b(salary|compensation|pay\b|lpa\b|ctc\b|package|band\b|offer|bonus|benefits?|equity|stock options?|vest(?:ing|ed|s)?|rsus?|esops?)\b/i,
+    boosts: { compensation: 0.5, card_artifact_negotiation: 0.35, derived_salary: 0.5 } },
+  { re: /\b(experience|work(ed)?|intern\w*|role\b|position|company|employer|years?|tenure)\b/i,
+    boosts: { experience: 0.3, identity: 0.15 } },
+  { re: /\b(project|built|build|created|developed|launch\w*|portfolio)\b/i,
+    boosts: { projects: 0.35 } },
+  { re: /\b(require\w*|required|qualif\w*|minimum|criteria|eligib\w*|meet\b|bar\b)\b/i,
+    boosts: { requirements: 0.4, compensation: 0.3 } },
+  { re: /\b(language|languages|programming|tech stack|technolog\w*|framework|tools?)\b/i,
+    boosts: { skills: 0.4, requirements: 0.25 } },
+  // "self-introduction" / "introductory" / "walk us through your background"
+  // (2026-09-11): `intro\b` did not match "introduction", so "could you give
+  // us a quick self-introduction?" boosted nothing, the port returned one
+  // stray chunk and the persona said it could not pull the résumé.
+  { re: /\b(intro\w*|self-?intro\w*|introduce|elevator|pitch|tell me about (yourself|myself)|walk (?:me|us) through (?:your|my) (?:background|profile|r[ée]sum[ée]|cv|experience)|(?:your|my) background)\b/i,
+    boosts: { identity: 0.4, card_artifact_intro: 0.35, experience: 0.3 } },
+  // IDENTITY & CONTACT LOOKUPS (2026-08-02 defect). The labelled identity
+  // section now matches "name"/"email"/"phone" lexically, but the phrasings
+  // people actually use in an interview overlay often name no field at all
+  // ("who am I", "how do they reach me", "my background"). Those still scored
+  // 0 on every chunk and produced a DOCUMENT_FACT_NOT_FOUND on an ingested
+  // résumé. Kept OFF the generic pronoun words ("my", "me") on purpose: a
+  // boost this broad would ride along on every first-person question and crowd
+  // the 6-item evidence cap.
+  { re: /\b(who am i|my name|name is|e-?mail|phone|mobile|contact (details|info\w*|number)|linkedin|github|portfolio|personal (site|website)|my (background|profile)|about me)\b/i,
+    boosts: { identity: 0.45 } },
+  // THE USER'S OWN ANSWERS (2026-10-14), for a profile read in passages. The
+  // questions they answer rarely share a word with the answer ("what would you
+  // say you need to work on?" against a paragraph about asking for help
+  // sooner), so the kinds of question the answers exist for admit them. On a
+  // profile handed over whole this does nothing: the answers are one item there.
+  { re: /\b(weakness\w*|strength\w*|improv\w*|work on\b|why (?:did|do|would|are|have) you|why'?d you|reason for (?:leaving|applying)|leav(?:e|ing)\b|left\b|motivat\w*|conflict\w*|disagree\w*|mistake\w*|fail(?:ed|ure|ures)?\b|regret\w*|salary|compensation|pay\b|relocat\w*|remote\b|hybrid\b|in[- ]office|on-?site|notice period|start date|when (?:can|could) you start|tell me about yourself|about yourself)\b/i,
+    boosts: { [OWN_ANSWERS_BOOST_KEY]: 0.3 } },
+];
+
+/** A raw chunk in a fired intent's vocabulary earns this share of the rule's largest boost… */
+/** Same weight the mode path uses (ModeHybridRetriever.ANCHOR_BOOST). */
+// `Number(env) || 0.25` made "=0" mean 0.25 — the switch could not switch off (review finding).
+const PROFILE_ANCHOR_BOOST = ((v) => (Number.isFinite(v) && v >= 0 ? v : 0.25))(parseFloat(process.env.NATIVELY_RETRIEVAL_ANCHOR_BOOST ?? ''));
+/** The boost applies only when at most this share of the chunks earns it. */
+const PROFILE_ANCHOR_MAX_SHARE = 0.1;
+/** Semantic-arm lift (see the interleave): minimum own score, share of the arm's best, floor and how many rows get it. */
+const SEMANTIC_ARM_MIN_SCORE = 0.2;
+const SEMANTIC_ARM_MIN_SHARE = 0.5;
+const SEMANTIC_ARM_FLOOR = 0.4;
+const SEMANTIC_ARM_FLOOR_ROWS = 3;
+const RAW_INTENT_BOOST_SHARE = 0.7;
+/** …unless more than this share of the raw chunks match it (then the class does not discriminate). */
+const RAW_INTENT_MAX_SHARE = 0.25;
+
+function intentBoosts(query: string): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const rule of INTENT_RULES) {
+    if (!rule.re.test(query)) continue;
+    for (const [k, v] of Object.entries(rule.boosts)) m.set(k, Math.max(m.get(k) ?? 0, v));
+  }
+  return m;
+}
+
+interface PortChunk {
+  sourceId: string;
+  fileName: string;
+  section: string;
+  text: string;
+  chunkIndex: number;
+  boostKey: string;
+  completeInventory: boolean;
+  inventoryCategory?: string;
+  /**
+   * POLICY-ADMITTED ONLY (2026-08-02): the chunk is served exclusively when an
+   * intent rule targeting its boostKey fires — its BM25 score is discarded.
+   * Exists for derived facts: the salary section's own safety disclaimer
+   * ("calculated from the résumé — role, location, skills, years of
+   * experience…") is a lexical keyword magnet that ranked it #2 on "tell me
+   * about my experience" / "what are my skills" in a real-DB probe, wasting an
+   * evidence slot and injecting compensation noise into non-salary answers.
+   * A derived fact is evidence by POLICY (the question asks for this fact),
+   * never by lexical accident.
+   */
+  policyOnly?: boolean;
+}
+
+/** Squash an unbounded BM25 score into the 0..1 band the mode/meeting ports
+ *  score in, so combineRetrievalPorts' global sort compares like with like. */
+const squash = (bm25: number): number => (bm25 <= 0 ? 0 : bm25 / (bm25 + 1.5));
+
+const normText = (s: string): string => s.toLowerCase().replace(/\s+/g, ' ').trim();
+
+/**
+ * A fail-closed RetrievalPort over Profile Intelligence sources, or null when
+ * the mode opts out of profile hydration or no authorized profile doc exists.
+ */
+export function createProfileRetrievalPort(input: ProfilePortInput): RetrievalPort | null {
+  const authorized = new Set<SourceType>(
+    input.profileSources.filter((t) => input.allowedSourceTypes.includes(t)),
+  );
+  if (authorized.size === 0) return null;
+
+  const excluded = new Set(input.excludeVersionIds ?? []);
+
+  const sourceTypes = new Map<string, SourceType>();
+  const activeVersions = new Map<string, string>();
+  const chunkVersions = new Map<string, string>();
+  const sourceScopes = new Map<string, EvidenceScope>();
+  const chunks: PortChunk[] = [];
+  /** Raw text of each registered résumé / JD; `wholeBlocked` when one of them has none. */
+  const wholeTexts = new Map<string, { fileName: string; text: string }>();
+  let wholeBlocked = false;
+  /** The user's own answers, as one text per fact document: handed over with a whole profile, never on their own. */
+  const ownAnswerTexts = new Map<string, { fileName: string; text: string }>();
+
+  for (const doc of input.docs) {
+    const mapped = TYPE_FOR_KIND[doc.kind];
+    if (!mapped || !authorized.has(mapped)) continue;           // mode did not opt in for this type
+    if (!doc.sourceId || !doc.versionId) continue;              // fail closed, never guess identity
+    if (excluded.has(doc.versionId)) continue;                  // canonical duplicate of a mode attachment
+
+    let idx = 0;
+    const seen = new Set<string>();
+    const push = (section: string, text: string, boostKey: string, completeInventory: boolean, inventoryCategory?: string) => {
+      const key = normText(text);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      chunks.push({
+        sourceId: doc.sourceId, fileName: doc.fileName, section, text, chunkIndex: idx++,
+        boostKey, completeInventory, inventoryCategory,
+        // Derived facts are policy-admitted, never lexically discovered — see
+        // PortChunk.policyOnly. The user's own answers are their words, not the
+        // app's: they rank like any other text.
+        policyOnly: doc.kind === 'fact' && boostKey !== OWN_ANSWERS_BOOST_KEY,
+      });
+    };
+
+    // DERIVED-EVIDENCE HYGIENE (2026-09-30, see profile-derived-support.ts): a
+    // résumé's structured extraction may hold a project description the
+    // extractor WROTE and placeholder identity values. Only what the raw
+    // résumé text supports is rendered as RESUME evidence.
+    const supported = doc.kind === 'resume'
+      ? stripUnsupportedDerivedResumeFields(doc.structured, doc.rawText)
+      : doc.structured;
+    // EXPERIENCE PAIRINGS (2026-10-09, see profile-derived-support.ts): when the
+    // résumé's own text shows one entry to pair a title with the wrong employer
+    // (or to be a line fragment), none of this résumé's derived experience
+    // statements is rendered — the per-entry sections, the complete-history
+    // line and, below, the per-role cards. The résumé text itself (the raw
+    // pieces and the whole document) is then what says who worked where.
+    const experienceUnsupported = doc.kind === 'resume' && unsupportedExperienceEntries(doc.structured, doc.rawText).length > 0;
+    const structured = experienceUnsupported && supported && typeof supported === 'object'
+      ? { ...(supported as Record<string, unknown>), experience: [] }
+      : supported;
+    const supportIndex = doc.kind === 'resume' ? buildSupportIndex(doc.rawText) : null;
+    for (const s of renderProfileSections(doc.kind, structured)) {
+      push(s.section, s.text, s.boostKey, s.completeInventory, s.inventoryCategory);
+    }
+    for (const c of doc.cards ?? []) {
+      if (c.approvalStatus === 'rejected') continue;
+      // AOT artifact cards (intro, pivot scripts, mock-answer keys, culture
+      // mapping, negotiation strategy) are model output about the candidate,
+      // not the document: never evidence.
+      if (isGeneratedArtifactCard(c)) continue;
+      if (experienceUnsupported && c.type === 'candidate_experience') continue;
+      const body = str(c.body);
+      if (!body) continue;
+      // A project card's body leads with the project description (card
+      // templates render it first, then "Technologies: …"): the same derived
+      // field, held to the same rule, so a card cannot smuggle it back in.
+      if (doc.kind === 'resume' && c.type === 'candidate_project') {
+        const lead = (body.split('\n')[0] ?? '').trim();
+        const isDescription = Boolean(lead) && lead !== str(c.title) && !/^technologies:/i.test(lead);
+        if (isDescription && !assessDerivedSupport(lead, supportIndex).supported) continue;
+      }
+      push(c.title || 'Card', `${c.title ? `${c.title}: ` : ''}${body}`, `card_${c.type ?? 'unknown'}`, false);
+    }
+    // LOSSLESS raw-text sections (deep-test D1), so a fact with no schema slot
+    // is still retrievable. Ranked by the same BM25 as everything else; deduped
+    // against the structured sections by normText via push().
+    //
+    // HEADING-AWARE since 2026-09-19. These were bare ~110-word windows, and a
+    // window carries no memory of the heading above it: "Worked with 7
+    // engineers under Greta Kovalenko" sat in a window that never said WHICH
+    // project, so "Who did you work under on Project Wicket-103?" matched the
+    // project's name in one window and the answer in another, and lost to 40
+    // sibling projects (measured: 12 of 12 such lookups missed on a 15k-token
+    // résumé). The mode path's chunker prefixes every chunk with its heading
+    // path and never splits mid-paragraph; the same one is used here.
+    // Not for a fact document: its sections ARE its text.
+    const raw = doc.kind === 'fact' ? '' : str(doc.rawText);
+    if (raw) {
+      const pieces = semanticChunks(raw);
+      pieces.forEach((piece, n) => push(`Document text (part ${n + 1})`, piece, 'raw_document', false));
+    }
+
+    if (idx === 0) continue;                                    // nothing renderable ⇒ not registered
+    if (doc.kind === 'resume' || doc.kind === 'jd') {
+      if (raw) wholeTexts.set(doc.sourceId, { fileName: doc.fileName, text: raw });
+      else wholeBlocked = true;
+    }
+    if (doc.kind === 'fact') {
+      const own = ownAnswersWholeText(doc.structured);
+      if (own) ownAnswerTexts.set(doc.sourceId, { fileName: doc.fileName, text: own });
+    }
+    sourceTypes.set(doc.sourceId, mapped);
+    activeVersions.set(doc.sourceId, doc.versionId);
+    chunkVersions.set(doc.sourceId, doc.versionId);
+    sourceScopes.set(doc.sourceId, { userId: input.userId });
+  }
+
+  if (sourceTypes.size === 0) return null;
+
+  // Handed over whole (see PROFILE_WHOLE_MAX_TOKENS): every registered résumé /
+  // JD has raw text and together they fit.
+  const wholeTokens = [...wholeTexts.values()].reduce((n, d) => n + Math.ceil(d.text.length / 4), 0);
+  const wholeEligible = input.wholeDocuments !== false && !wholeBlocked && wholeTexts.size > 0 && wholeTokens <= PROFILE_WHOLE_MAX_TOKENS;
+
+  // Corpus arbitration over THIS port's chunks (see orchestrator). Statistics
+  // are built once per port — a port is constructed per turn from documents
+  // that do not change within it.
+  let probeStats: ReturnType<typeof buildLexicalStats> | undefined;
+  const anchoredSources = (question: string): SourceType[] => {
+    if (probeStats === undefined) probeStats = buildLexicalStats(chunks.map((c) => `${c.section} ${c.text}`));
+    if (!probeStats) return [];
+    const out = new Set<SourceType>();
+    for (const i of anchoringChunkIndexes(question, probeStats)) {
+      // The app's OWN derived text (the salary estimate and its disclaimer) is not
+      // a document: "Which skills and years of experience matter for a role in
+      // this location?" anchored on the disclaimer's wording (review finding).
+      if (chunks[i].policyOnly) continue;
+      const t = sourceTypes.get(chunks[i].sourceId);
+      if (t) out.add(t);
+    }
+    return [...out];
+  };
+
+  const port = createLegacyRetrievalPort({
+    registry: { sourceTypes, activeVersions, chunkVersions, sourceScopes },
+    retrieve: async (query: string, opts: { topK: number; timeoutMs?: number; sourceTypes?: readonly SourceType[]; intentQuery?: string; wholeProfile?: boolean; wholeOwnAnswers?: boolean }): Promise<LegacyChunk[]> => {
+      // Whole only when the PLAN says so: it is the plan that made the room for
+      // the documents (item cap, token budget). Without it the packer would cut
+      // them, so a caller that has not sized the profile gets passages as before.
+      const whole = wholeEligible && opts.wholeProfile === true;
+      // The user's own answers go whole on their own plan flag, so a résumé read
+      // in passages, or no résumé at all, still has them in view (orchestrator).
+      const wholeAnswers = ownAnswerTexts.size > 0 && opts.wholeOwnAnswers === true;
+      // Only the PLANNED types compete for the top-k (2026-09-11). Measured in
+      // technical-interview: "Tell me about your education — degree, school,
+      // coursework" planned [RESUME, …] without JOB_DESCRIPTION, but the JD's
+      // requirement lines outscored the résumé's EDUCATION section on those
+      // very words, filled 13 of the 14 slots, were all rejected at the type
+      // gate — and the one résumé chunk that survived was the wrong one, so
+      // the persona said it had no education details in front of it.
+      const planned = opts.sourceTypes?.length ? new Set(opts.sourceTypes) : null;
+      const index = new Bm25Index(chunks.map((c, i) => ({ id: String(i), text: `${c.section} ${c.text}` })), DEFAULT_BM25);
+      const bm25ById = new Map(index.score(query).map((s) => [s.id, s.score]));
+      // POLICY reads the user's question, RANKING reads the query (review finding,
+      // reproduced). A model-rewritten query once carried the word "experience":
+      // that fired the employment intent, admitted the complete-experience
+      // inventory at 0.6 with no term match, and "What is my biggest weakness?"
+      // went from NONE to FULL — a model talking evidence into existence.
+      const asked = opts.intentQuery ?? query;
+      const boosts = intentBoosts(asked);
+      // INTENT VOCABULARY REACHES THE RAW TEXT (2026-09-19). An intent rule's
+      // regex is a synonym class — salary|compensation|pay|package|bonus — but
+      // its boost went only to STRUCTURED sections and derived facts. Measured
+      // live on a 15k-token job description: "How much does the position pay?"
+      // boosted the (empty — structuring was lossy) compensation section and
+      // the app's own derived salary ESTIMATE; the raw chunk that says "Base
+      // salary range for this role is $214,000–$262,000" got nothing, because
+      // BM25 cannot match "pay" to "salary" — and the answer stated the
+      // estimate, 158–183k EUR, as fact. A raw chunk whose own text falls in a
+      // fired rule's class now earns a share of that boost. Only when the class
+      // is DISCRIMINATIVE over the raw text: "experience|work|role|company"
+      // matches most of a résumé and would lift everything equally.
+      // ANCHOR BOOST (2026-09-20) — the mode path has had it since 09-19; this
+      // port did not. An intent boost ranks a section by its TYPE, blind to
+      // whether it holds what the question NAMES. Measured with the structuring
+      // LLM's real output for a 15k-token résumé: "How many engineers did you
+      // work with on Project Cinder-115?" fired the project intent, and all six
+      // evidence slots went to structured sections about FOUR OTHER projects
+      // (0.72–0.98) while the raw chunk that says "Cinder-115 … worked with 7
+      // engineers" was cut at the cap. Lexical questions reached the prompt 50%
+      // of the time, sibling facts 58% — with structured data absent it was
+      // 100%, so the better the structuring, the worse the retrieval.
+      //
+      // Same rule as ModeHybridRetriever.lexicalScores: ANCHOR_BOOST × (idf-
+      // weighted coverage of the question's distinctive terms)². Squared, so a
+      // chunk holding one anchor of three gets a ninth of it and a chunk holding
+      // all of them gets all of it.
+      if (probeStats === undefined) probeStats = buildLexicalStats(chunks.map((c) => `${c.section} ${c.text}`));
+      // At least TWO anchors, as the corpus probe requires. With one, every chunk
+      // that happens to hold that word has coverage 1.0: "Who does this role
+      // report to?" has the single anchor "report", the answer says "reports to"
+      // (no stemming — it does not even match), and six team blurbs mentioning a
+      // "report" took all six slots at +0.25. One shared word is what BM25
+      // already scores; NAMING something takes two.
+      const anchorCandidates = probeStats ? anchorTerms(questionContentWords(query), probeStats) : null;
+      // …and the anchored set must be SMALL. "role" and "report" both clear the
+      // anchor bar on a résumé + JD (each in just under half the chunks), and 35
+      // of 167 chunks then cover ≥ 60% of them — a boost that a fifth of the
+      // corpus earns ranks nothing, it only overrides BM25's own ordering, which
+      // had the "Reporting line" section first. Same idea as
+      // RAW_INTENT_MAX_SHARE: a signal must be discriminative to be a signal.
+      const anchoredCount = anchorCandidates && probeStats && anchorCandidates.size >= PROBE_MIN_ANCHORS
+        ? probeStats.sets.reduce((n, set) => n + (anchorCoverage(anchorCandidates, set) >= PROBE_MIN_COVERAGE ? 1 : 0), 0)
+        : 0;
+      const anchors = anchorCandidates && anchoredCount > 0
+        && anchoredCount <= Math.max(3, chunks.length * PROFILE_ANCHOR_MAX_SHARE) ? anchorCandidates : null;
+      const anchorBoost = (i: number): number => {
+        if (!anchors || !probeStats || i < 0) return 0;
+        const cov = anchorCoverage(anchors, probeStats.sets[i]);
+        // GATED at the corpus probe's coverage bar. Ungated, a chunk sharing one
+        // minor anchor ("experience" in "Do I have Kubernetes experience?") got
+        // +0.004 — nothing, except that policy-admitted inventories sit at a
+        // FIXED 0.600, and that nudge lifted a résumé bullet from 0.605 past the
+        // skills inventory that proves the absence: answerability FULL → PARTIAL
+        // (ProfileSourceRouting2026_07_31 caught it). A chunk "holds what the
+        // question names" when it holds most of it, or the boost is noise that
+        // reshuffles near-ties.
+        return cov >= PROBE_MIN_COVERAGE ? PROFILE_ANCHOR_BOOST * cov * cov : 0;
+      };
+      const firedRules = INTENT_RULES.filter((rule) => rule.re.test(asked));
+      const rawIdx = chunks.map((c, i) => (c.boostKey === 'raw_document' ? i : -1)).filter((i) => i >= 0);
+      const rawIntentBoost = new Map<number, number>();
+      for (const rule of firedRules) {
+        const hits = rawIdx.filter((i) => rule.re.test(chunks[i].text));
+        if (hits.length === 0 || hits.length > Math.max(3, rawIdx.length * RAW_INTENT_MAX_SHARE)) continue;
+        const share = Math.max(...Object.values(rule.boosts)) * RAW_INTENT_BOOST_SHARE;
+        for (const i of hits) rawIntentBoost.set(i, Math.max(rawIntentBoost.get(i) ?? 0, share));
+      }
+
+      // The semantic arm, when the caller wired one. Its chunks JOIN the BM25
+      // raw-text chunks — a UNION, deduplicated by text with the better score
+      // kept. The first cut REPLACED the BM25 raw chunks and failed its own gate:
+      // measured on plain-text job descriptions, lexical questions fell from 100%
+      // to 91–95%, because when the hybrid ranker misses a lexically obvious
+      // chunk, BM25's hit went with it. The two arms fail differently; neither
+      // may silence the other.
+      let semanticRaw: RawRetrievedChunk[] = [];
+      if (input.rawRetriever && !whole) {
+        // A DEADLINE and a VOICE (review finding, reproduced): the arm was awaited
+        // with no budget — a 6 s embedding stall held back BM25 evidence that was
+        // already computed and the turn took 6,008 ms — and a throwing arm left
+        // no trace anywhere. It now gets the plan's timeout, and losing it costs
+        // only the arm: the BM25 evidence goes out.
+        const budgetMs = Math.max(200, opts.timeoutMs ?? 1200);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          semanticRaw = (await Promise.race([
+            input.rawRetriever(query, { topK: Math.max(1, opts.topK), timeoutMs: budgetMs }),
+            new Promise<RawRetrievedChunk[]>((_, reject) => { timer = setTimeout(() => reject(new Error(`semantic arm exceeded ${budgetMs} ms`)), budgetMs); }),
+          ])) ?? [];
+        } catch (e) {
+          console.warn(`[ProfileRetrievalPort] semantic arm unavailable this turn (${e instanceof Error ? e.message : String(e)}); using BM25 only`);
+          semanticRaw = [];
+        } finally { if (timer) clearTimeout(timer); }
+        semanticRaw = semanticRaw.filter((r) => r && typeof r.text === 'string' && r.text.trim() && sourceTypes.has(r.sourceId));
+      }
+      const useSemantic = semanticRaw.length > 0;
+      const discriminative = firedRules.filter((rule) => {
+        const hits = rawIdx.filter((i) => rule.re.test(chunks[i].text)).length;
+        return hits > 0 && hits <= Math.max(3, rawIdx.length * RAW_INTENT_MAX_SHARE);
+      });
+      const semanticScored = semanticRaw.map((r) => {
+        const fileName = chunks.find((c) => c.sourceId === r.sourceId)?.fileName ?? '';
+        const intent = discriminative.filter((rule) => rule.re.test(r.text))
+          .reduce((mx, rule) => Math.max(mx, Math.max(...Object.values(rule.boosts)) * RAW_INTENT_BOOST_SHARE), 0);
+        const c: PortChunk = { sourceId: r.sourceId, fileName, section: 'Document text', text: r.text, chunkIndex: 100_000 + r.chunkIndex, boostKey: 'raw_document', completeInventory: false, policyOnly: false } as PortChunk;
+        return { c, score: Math.min(1, Math.max(0, r.score) + intent) };
+      });
+
+      const normText = (t: string) => t.replace(/^\[context:[^\]]*\]\s*/i, '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const semanticByText = new Map<string, { c: PortChunk; score: number }>();
+      for (const row of semanticScored) {
+        const k = `${row.c.sourceId}|${normText(row.c.text)}`;
+        const prev = semanticByText.get(k);
+        if (!prev || row.score > prev.score) semanticByText.set(k, row);
+      }
+
+      const scoredChunks = chunks
+        .map((c, i) => ({ c, i }))
+        .map(({ c, i }) => {
+          const lexical = squash(bm25ById.get(String(i)) ?? 0);
+          const boost = (boosts.get(c.boostKey) ?? 0) + (rawIntentBoost.get(i) ?? 0);
+          // A boost with NO lexical signal must rank BELOW genuine matches —
+          // additive flat boosts were crowding real mode-attachment hits out of
+          // the 6-item cap (review finding). ONE exception, by design: a
+          // COMPLETE INVENTORY targeted by a fired intent is admitted at a
+          // fixed 0.6. Absence evidence can never rank on similarity — the
+          // skills list that proves "Kubernetes is not listed" deliberately
+          // does not contain the word Kubernetes — so it is policy-admitted at
+          // a level below real matches (0.7+) but above the cut line. Bounded:
+          // at most one or two inventory chunks per fired intent.
+          const boostOnly = c.completeInventory && boost > 0 ? 0.6 : Math.min(0.35, boost);
+          // policyOnly (derived facts): lexical score DISCARDED. Admitted at the
+          // inventory level (0.6 — beneath real matches, above the cut) only
+          // when an intent rule targeting the chunk's own boostKey fired.
+          const score = c.policyOnly
+            ? (boost > 0 ? 0.6 : 0)
+            : (lexical > 0 ? Math.min(1, lexical * 0.85 + boost + anchorBoost(i)) : boostOnly);
+          return { c, score };
+        });
+
+      // RANK-MATCHED INTERLEAVE. The two arms score on different scales — BM25's
+      // squashed score sits near 0.7–0.9 for any chunk sharing the question's
+      // words, a hybrid cosine blend near 0.3–0.5 for a correct paraphrase hit —
+      // so a plain union sorted by score let lexical look-alikes push every
+      // semantic hit past the cap (measured: the union gained 2 points where
+      // replacement gained 5). The semantic arm's rank-r chunk is therefore
+      // lifted to at least the BM25 raw arm's rank-r score: the arms alternate,
+      // neither scale wins by being louder. Same text from both → ONE row.
+      if (useSemantic) {
+        const bm25RawDesc = scoredChunks.filter((s) => s.c.boostKey === 'raw_document').map((s) => s.score).sort((a, b) => b - a);
+        const rowByKey = new Map<string, { c: PortChunk; score: number }>();
+        for (const row of scoredChunks) if (row.c.boostKey === 'raw_document') rowByKey.set(`${row.c.sourceId}|${normText(row.c.text)}`, row);
+        const ranked = [...semanticByText.entries()].sort((a, b) => b[1].score - a[1].score);
+        // Four corrections from an adversarial review that ran the real arm (2026-09-20):
+        //  · RELEVANCE GATE — the lift used to apply to whatever the arm returned.
+        //    The retriever guarantees every file a row, so a résumé question got
+        //    the JD's title line (native 0.18) lifted into slot 2 of 6. Only rows
+        //    near the arm's best are lifted; heading-only chunks never are.
+        //  · FLOOR — on a PURE paraphrase every BM25 raw score is 0, so the lift
+        //    lifted to nothing and the right chunk (0.26) lost to five boost-only
+        //    sections at 0.30: the arm failed in exactly the case it exists for.
+        //    Its top rows now sit just above the boost-only ceiling (0.35) and
+        //    below a policy-admitted inventory (0.6).
+        //  · SCALE — the arm's reported score includes its own answerability and
+        //    anchor boosts (sibling sections reached 0.83); it may not exceed the
+        //    BM25 arm's best on its own say-so.
+        //  · TIES — an exact lexical match keeps first place. The semantic row goes
+        //    first only when BM25 itself is tied at that rank (near-identical
+        //    sections), where a chunk-index tie-break would bury it behind all of them.
+        const armBest = ranked.length ? ranked[0][1].score : 0;
+        const ceiling = Math.max(bm25RawDesc[0] ?? 0, SEMANTIC_ARM_FLOOR);
+        let rank = 0;
+        for (const [k, sem] of ranked) {
+          const body = normText(sem.c.text);
+          const relevant = sem.score >= SEMANTIC_ARM_MIN_SCORE && sem.score >= armBest * SEMANTIC_ARM_MIN_SHARE && body.length >= 40;
+          let target = Math.min(sem.score, ceiling);
+          if (relevant) {
+            const at = bm25RawDesc[rank] ?? 0;
+            const tied = rank + 1 < bm25RawDesc.length && Math.abs(at - bm25RawDesc[rank + 1]) < 1e-9;
+            const lifted = at > 0 ? Math.min(1, Math.max(0, at + (tied ? 1e-6 : -1e-6))) : 0;
+            const floor = rank < SEMANTIC_ARM_FLOOR_ROWS ? SEMANTIC_ARM_FLOOR - rank * 0.01 : 0;
+            target = Math.max(target, lifted, floor);
+            rank += 1;
+          }
+          const twin = rowByKey.get(k);
+          if (twin) { twin.score = Math.max(twin.score, target); semanticByText.delete(k); }
+          else sem.score = target;
+        }
+      }
+
+      // WHOLE: each document once, entire, in place of its passages. Score 1, like
+      // a reference file read whole: nothing here was ranked, and the document
+      // must not lose its place to the sections cut from it.
+      // The user's own answers ride along as one more whole item, in place of
+      // their per-answer sections: the question that needs one rarely shares a
+      // word with it, and together they are a few hundred tokens.
+      const wholeRows = [...(whole ? wholeTexts.entries() : []), ...(wholeAnswers ? ownAnswerTexts.entries() : [])].map(([sourceId, d]) => ({
+        c: { sourceId, fileName: d.fileName, section: PROFILE_WHOLE_SECTION, text: d.text, chunkIndex: 200_000, boostKey: 'whole_document', completeInventory: false } as PortChunk,
+        score: 1,
+      }));
+
+      return scoredChunks
+        .filter((s) => !(whole && s.c.boostKey === 'raw_document') && !(wholeAnswers && s.c.boostKey === OWN_ANSWERS_BOOST_KEY))
+        .concat(wholeRows)
+        .concat([...semanticByText.values()].map((row) => ({ ...row, i: -1 })))
+        .filter((s) => s.score > 0.05)
+        .filter((s) => !planned || planned.has(sourceTypes.get(s.c.sourceId) as SourceType))
+        .sort((a, b) => b.score - a.score || a.c.chunkIndex - b.c.chunkIndex)
+        .slice(0, Math.max(1, opts.topK))
+        .map(({ c, score }) => ({
+          sourceId: c.sourceId,
+          fileName: c.fileName,
+          section: c.section,
+          text: c.text,
+          chunkIndex: c.chunkIndex,
+          score,
+          // Provenance (issue 10 / Pattern D): derived from the registry role
+          // this port itself declared for the document — never from content.
+          provenance: sourceTypes.get(c.sourceId) === 'JOB_DESCRIPTION'
+            ? 'PROFILE_JOB_DESCRIPTION'
+            : sourceTypes.get(c.sourceId) === 'RESUME'
+              ? 'PROFILE_RESUME' : 'PROFILE_FACT',
+          // Carried through the adapter so evidenceSupportsClaim can treat a
+          // checked COMPLETE inventory as grounded support for absence answers
+          // — category-matched, so the shortcut only fires for the claim class
+          // the record actually enumerates.
+          metadata: c.completeInventory
+            ? { completeInventory: true, ...(c.inventoryCategory ? { inventoryCategory: c.inventoryCategory } : {}) }
+            : (c.boostKey === 'whole_document' ? { wholeDocument: true } : {}),
+        }));
+    },
+  });
+  return {
+    ...port,
+    probeAnchors: (question: string): boolean => { try { return anchoredSources(question).length > 0; } catch { return false; } },
+    probeAnchorSources: (question: string): SourceType[] => { try { return anchoredSources(question); } catch { return []; } },
+  };
+}

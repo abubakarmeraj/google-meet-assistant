@@ -1,0 +1,843 @@
+// MeetingSummaryV3.ts
+// Canonical, spec-aligned schema for Natively post-meeting notes (Phase 5).
+//
+// This is the single source of truth for the MeetingSummaryV3 shape and its runtime
+// validation/repair. It deliberately uses a hand-written validator (no new dependency)
+// that mirrors the repo's existing defensive-coercion convention. The validator never
+// throws and always returns a usable result or a clear `ok:false` so the caller can fall
+// back safely.
+//
+// Privacy: this module only shapes/validates data. It performs no I/O, no telemetry, and
+// no network calls. Evidence quotes live only inside the note object (stored locally).
+
+export type Confidence = 'high' | 'medium' | 'low';
+
+export type SummaryStatus =
+  | 'queued'
+  | 'chunking'
+  | 'summarizing_chunks'
+  | 'reducing'
+  | 'validating'
+  | 'completed'
+  | 'failed';
+
+export type SummaryStrategy = 'direct' | 'map_reduce' | 'long_context' | 'fallback';
+
+export interface EvidenceRef {
+  speakerId?: string;
+  speakerName?: string;
+  timestampMs?: number;
+  quote?: string;
+  segmentId?: string;
+}
+
+export interface NoteBullet {
+  id?: string;
+  text: string;
+  evidence?: EvidenceRef[];
+  confidence?: Confidence;
+  /**
+   * The line restates or fills in a point the user typed in their own notes
+   * during the meeting (2026-10-15). Absent: written from the transcript only.
+   * The meeting page shows these lines in the primary text colour.
+   */
+  fromUserNotes?: boolean;
+}
+
+export interface MeetingNoteSection {
+  id: string;
+  title: string;
+  bullets: NoteBullet[];
+  order: number;
+}
+
+export interface DecisionItem {
+  id?: string;
+  text: string;
+  owner?: string;
+  timestampMs?: number;
+  evidence?: EvidenceRef[];
+  confidence: Confidence;
+  /** From a point in the user's own notes (see NoteBullet.fromUserNotes). */
+  fromUserNotes?: boolean;
+}
+
+export interface ActionItem {
+  id?: string;
+  text: string;
+  owner?: string;
+  deadline?: string;
+  sourceTimestampMs?: number;
+  explicitness: 'explicit' | 'inferred';
+  evidence?: EvidenceRef[];
+  confidence: Confidence;
+  status?: 'open' | 'done' | 'deferred';
+  /** Also in the previous meeting of this series (2026-10-15; absent on older notes). */
+  carriedOver?: boolean;
+  /** Whose it is: the user's side ("ours") or the other side of the call ("theirs"). */
+  party?: 'ours' | 'theirs';
+  /** From a point in the user's own notes (see NoteBullet.fromUserNotes). */
+  fromUserNotes?: boolean;
+}
+
+export interface QuestionItem {
+  id?: string;
+  text: string;
+  owner?: string;
+  status: 'open' | 'answered' | 'deferred';
+  evidence?: EvidenceRef[];
+  confidence?: Confidence;
+  /** Also open in the previous meeting of this series (2026-10-15). */
+  carriedOver?: boolean;
+  /** From a point in the user's own notes (see NoteBullet.fromUserNotes). */
+  fromUserNotes?: boolean;
+}
+
+export interface RiskItem {
+  id?: string;
+  text: string;
+  severity: 'low' | 'medium' | 'high';
+  evidence?: EvidenceRef[];
+  confidence?: Confidence;
+}
+
+export type FollowUpDraftType =
+  | 'email'
+  | 'slack'
+  | 'project_update'
+  | 'crm_note'
+  | 'study_notes'
+  | 'interview_feedback';
+
+export type FollowUpTone = 'professional' | 'warm' | 'concise' | 'friendly';
+
+export interface FollowUpDraft {
+  type: FollowUpDraftType;
+  subject?: string;
+  body: string;
+  tone: FollowUpTone;
+  basedOnActionItemIds?: string[];
+  basedOnDecisionIds?: string[];
+  /** Written in the user's own voice, from their saved writing (outputs/writingStyle.ts). */
+  styled?: boolean;
+}
+
+export type TimelineItemType = 'topic_shift' | 'decision' | 'action_item' | 'risk' | 'question';
+
+export interface TimelineItem {
+  id?: string;
+  timestampMs?: number;
+  title: string;
+  description?: string;
+  type: TimelineItemType;
+  evidence?: EvidenceRef[];
+}
+
+export interface PersonMention {
+  speakerId?: string;
+  name?: string;
+  role?: string;
+  organization?: string;
+  mentions?: number;
+  confidence?: Confidence;
+}
+
+export interface SourceQuality {
+  transcriptCoverage: number; // 0..1
+  speakerQuality: 'good' | 'mixed' | 'poor';
+  actionItemConfidence: Confidence;
+  warnings: string[];
+}
+
+// Per-meeting map of canonical speaker id → user-assigned display name.
+// e.g. { "speaker_1": "John from Client", "speaker_2": "Sarah, PM" }
+// "me" is reserved for the local user and is renameable too.
+export type SpeakerLabelMap = Record<string, string>;
+
+export interface MeetingSummaryModeMeta {
+  selectedModeId?: string;
+  selectedModeName?: string;
+  selectedTemplateType?: string;
+  detectedModeId?: string;
+  detectedModeName?: string;
+  detectedConfidence?: number;
+  summaryModeUsed?: string;
+}
+
+export interface MeetingSummaryGenerationMeta {
+  strategy: SummaryStrategy;
+  provider?: string;
+  model?: string;
+  startedAt: string;
+  completedAt?: string;
+  durationMs?: number;
+  chunkCount?: number;
+  warnings: string[];
+}
+
+// Render/back-compat helper block (additive; not part of the strict spec but kept so the
+// UI can render typed blocks and copy/export without re-deriving structure).
+export type NoteBlock =
+  | { type: 'heading'; text: string }
+  | { type: 'bullet'; text: string; evidence?: EvidenceRef[] }
+  | { type: 'action'; item: ActionItem }
+  | { type: 'decision'; item: DecisionItem }
+  | { type: 'question'; item: QuestionItem }
+  | { type: 'risk'; item: RiskItem }
+  | { type: 'quote'; text: string; speaker?: string; timestampMs?: number };
+
+export interface MeetingSummaryV3 {
+  schemaVersion: 3;
+  title: string;
+  tldr: string[];
+  overview: string;
+  whatChanged: string[];
+  decisions: DecisionItem[];
+  actionItems: ActionItem[];
+  openQuestions: QuestionItem[];
+  risks: RiskItem[];
+  sections: MeetingNoteSection[];
+  followUpDraft?: FollowUpDraft;
+  timeline?: TimelineItem[];
+  people?: PersonMention[];
+  topics?: string[];
+  sourceQuality: SourceQuality;
+  mode: MeetingSummaryModeMeta;
+  generation: MeetingSummaryGenerationMeta;
+  // Additive render/export helpers:
+  noteBlocks?: NoteBlock[];
+  recipes?: Record<string, string>;
+}
+
+export interface ValidationResult<T> {
+  ok: boolean;
+  data?: T;
+  errors: string[];
+  repaired: boolean;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Coercion primitives
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NUL_RE = /\x00/g;
+const FENCE_RE = /```/g;
+const FILLER_RE = /\b(the meeting discussed|covered various|talked about various|various topics|the conversation covered)\b/i;
+const VALID_CONFIDENCE = new Set<Confidence>(['high', 'medium', 'low']);
+const VALID_EXPLICITNESS = new Set(['explicit', 'inferred']);
+const VALID_QUESTION_STATUS = new Set(['open', 'answered', 'deferred']);
+const VALID_ACTION_STATUS = new Set(['open', 'done', 'deferred']);
+const VALID_RISK_SEVERITY = new Set(['low', 'medium', 'high']);
+const VALID_TIMELINE_TYPE = new Set<TimelineItemType>(['topic_shift', 'decision', 'action_item', 'risk', 'question']);
+const VALID_FOLLOWUP_TYPE = new Set<FollowUpDraftType>(['email', 'slack', 'project_update', 'crm_note', 'study_notes', 'interview_feedback']);
+const VALID_FOLLOWUP_TONE = new Set<FollowUpTone>(['professional', 'warm', 'concise', 'friendly']);
+
+// Realistic density is 5-12 findings per section per chunk; a well-covered section across
+// 4-10 chunks can legitimately reach ~120 bullets. This cap exists only to bound pathological
+// input (a runaway chunk count or a misbehaving extractor), not to trim a normal dense
+// meeting — 500 is far above anything the density contract should ever produce.
+//
+// Single source of truth: MeetingSummaryReducer.buildSections applies this same cap (with its
+// own truncation warning) BEFORE validateMeetingSummaryV3 runs, and sanitizeSections below
+// applies it again as the schema's own floor (so any summary object, not just one produced by
+// the reducer, gets the same protection). Both call sites import this constant so they cannot
+// drift apart.
+export const SECTION_BULLET_CAP = 500;
+
+export function cleanString(value: unknown): string {
+  return String(value ?? '').replace(NUL_RE, '').replace(/\s+/g, ' ').trim();
+}
+
+export function cleanNoteText(value: unknown, max = 240): string {
+  return cleanString(value).replace(FENCE_RE, '').replace(FILLER_RE, '').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Meeting title shape guard
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// The title is the one summary field with no schema validator behind it and the
+// widest UI surface (history rows, window titles, email subjects). The prompt
+// asks for three to six words, but that is advice, not a bound — a model that
+// answers the transcript instead of naming it writes its whole reply into the
+// title column. Two real rows, 2026-08-02:
+//
+//   197 chars  "I'm Natively, an AI assistant developed by Evin John. I help you ..."
+//    60 chars  "A third-party GraphQL client is a separate tool, service, or"
+//
+// So the bound lives here, in code, and is deliberately prompt-agnostic: it has
+// to hold whichever prompt system produced the text. The caps sit above the
+// prompt's 3-6 words so a title that already obeys the contract is never
+// touched — this only fires when generation has already gone wrong.
+//
+// Applied to GENERATED titles only. Calendar- and user-supplied titles are the
+// user's own words and keep whatever length they have.
+export const MEETING_TITLE_MAX_WORDS = 8;
+export const MEETING_TITLE_MAX_CHARS = 70;
+
+// Spoken-answer furniture the composer can append to any output. A [[GIST]]
+// line renders as a summary chip on screen; glued onto a title it is noise.
+const GIST_MARKER = '[[GIST]]';
+// "Title:", "Meeting title -", "Here's the title:", "Suggested title —", ...
+const TITLE_PREAMBLE_RE = /^(?:here(?:'s|\s+is|\s+are)\s+)?(?:the\s+|a\s+|an\s+)?(?:suggested\s+|proposed\s+|meeting\s+|concise\s+)*title\s*[:\-–—]\s*/i;
+// Double quotes go everywhere, not just at the ends — stripping only a wrapping
+// pair turns `Review of "Project Falcon"` into an unbalanced `Review of "Project
+// Falcon`. The prompt bans quotation marks in titles outright, and the call site
+// this replaced stripped every `"`, so parity and correctness agree here.
+const DOUBLE_QUOTES_RE = /["“”«»]/g;
+// Single quotes only when they wrap, so `Sam's 1:1` keeps its apostrophe.
+const WRAPPING_SINGLE_QUOTES_RE = /^['‘’]+|['‘’]+$/g;
+// A title that ends on a connective was cut mid-thought; the stub reads worse
+// than dropping it. Only ever applied to text this function truncated — an
+// author who genuinely named a meeting "Sync On" keeps it.
+const DANGLING_WORD_RE = /[\s,]+(?:and|or|but|with|for|to|of|in|on|at|by|from|as|the|a|an)$/i;
+
+/** A hyphen / en dash / em dash / bullet followed by a space, at the start of a title. */
+const LEADING_LIST_MARKER_RE = /^[-–—•]+\s+/;
+
+export function cleanMeetingTitle(
+  value: unknown,
+  opts?: { maxWords?: number; maxChars?: number },
+): string {
+  const maxWords = opts?.maxWords ?? MEETING_TITLE_MAX_WORDS;
+  const maxChars = opts?.maxChars ?? MEETING_TITLE_MAX_CHARS;
+
+  let text = String(value ?? '').replace(NUL_RE, '');
+
+  const gistAt = text.indexOf(GIST_MARKER);
+  if (gistAt >= 0) text = text.slice(0, gistAt);
+
+  // An over-explaining model puts the title on the first line and its reasoning
+  // underneath. Take the first line that has content.
+  text = text.replace(FENCE_RE, '');
+  text = text.split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? '';
+
+  const stripQuotes = (s: string) => s.replace(DOUBLE_QUOTES_RE, '').replace(WRAPPING_SINGLE_QUOTES_RE, '');
+
+  text = stripQuotes(cleanString(
+    text
+      .replace(/\*+/g, '')
+      .replace(/`/g, '')
+      .replace(/^#+\s*/, '')
+      // A list marker the model put in front of the title ("- Summary was missing…").
+      .replace(LEADING_LIST_MARKER_RE, ''),
+  ));
+
+  text = stripQuotes(cleanString(text.replace(TITLE_PREAMBLE_RE, ''))).trim();
+  // ...and again once wrapping quotes are off: "\"- Q4 planning\"" only shows its marker now.
+  text = text.replace(LEADING_LIST_MARKER_RE, '');
+  if (!text) return '';
+
+  let words = text.split(' ');
+  let truncated = false;
+
+  // Prose rather than a title: keep the first sentence before clamping, so the
+  // cut lands on a thought boundary instead of mid-clause. Gated on already
+  // being over budget so "Sync with Dr. Patel" is never cut at "Dr.".
+  if (words.length > maxWords) {
+    const firstSentence = text.split(/(?<=[.!?])\s+/)[0]?.trim() ?? '';
+    const sentenceWords = firstSentence ? firstSentence.split(' ') : [];
+    if (sentenceWords.length >= 2 && sentenceWords.length < words.length) {
+      words = sentenceWords;
+      truncated = true;
+    }
+  }
+
+  if (words.length > maxWords) {
+    words = words.slice(0, maxWords);
+    truncated = true;
+  }
+  let out = words.join(' ');
+
+  if (out.length > maxChars) {
+    out = out.slice(0, maxChars);
+    const lastSpace = out.lastIndexOf(' ');
+    // Only break on a word boundary when one exists late enough to leave a
+    // readable title; a single over-long token is cut hard instead.
+    if (lastSpace > maxChars / 2) out = out.slice(0, lastSpace);
+    truncated = true;
+  }
+
+  out = out.replace(/[\s.,;:!?\-–—]+$/g, '').trim();
+  if (truncated) {
+    while (DANGLING_WORD_RE.test(out)) out = out.replace(DANGLING_WORD_RE, '').trim();
+    out = out.replace(/[\s.,;:!?\-–—]+$/g, '').trim();
+  }
+
+  return out;
+}
+
+// ── Answer-fragment title rejection (RC-7 adjacent, live session C 2026-08-21) ──
+// The length clamp above bounds SIZE, not SEMANTICS. Live rows from one session:
+//
+//   402 chars -> "Here's the C++ implementation"
+//   294 chars -> "cpp"
+//   185 chars -> "I'm sorry, but I don't have the full"
+//    60 chars -> "Return [0, 1] for the two numbers that"
+//
+// All are the model ANSWERING the transcript instead of naming it, clamped to a
+// first sentence. A rejected generated title is simply not applied — the
+// meeting keeps its default until the structured V3 summary title (usually
+// well-formed) lands, and user renames outrank both via user_titled.
+// Deliberately conservative: only clear answer/refusal shapes are rejected, so
+// a legitimate terse title ("Standup", "Sync with Dr. Patel") always passes.
+const ANSWER_FRAGMENT_TITLE_RES: RegExp[] = [
+  // Answer openers: "Here's the…", "Here is what…"
+  /^here(?:'s|\s+is|\s+are)\b/i,
+  // Refusals / apologies: "I'm sorry…", "I don't have…", "Unfortunately…"
+  /^(?:i'?m sorry|sorry\b|i apologi[sz]e|i don'?t (?:have|know)|i can(?:no|')t|unfortunately)\b/i,
+  // Code-answer imperatives: "Return [0, 1] for the two numbers that…"
+  /^(?:return|print|output|write|implement|initialize)\b/i,
+  // Conversational acknowledgements: "Yes, that's right", "Okay, so…"
+  /^(?:yes|no|sure|okay|ok|yeah|yep)\b\s*[,.!]/i,
+  // Complexity notation ("O(1)", "O(n log n)") is handled by
+  // isComplexityAnswerTitle below — a blanket reject also threw away
+  // legitimate DSA-interview names ("O(1) Store Class Design", 2026-08-26).
+  // ── Session E live misses (2026-08-23) ────────────────────────────────
+  // First-person answer speech: "I'll switch the solution to C++". A meeting
+  // name never opens with "I " / "I'…" ("I/O Performance Review" is safe —
+  // no space or apostrophe after the I).
+  /^i(?:['’]|\s)/i,
+  // "<language> code <verb>…" describes an answer, it doesn't name a meeting
+  // ("Python code also uses the same backtracking approach"). Verb-anchored
+  // so "Legacy Code Review" stays a valid title.
+  /\bcode (?:also\s+|just\s+)?(?:uses|is|does|works|runs|solves|looks)\b/i,
+  // Malayalam first/second-person pronouns — answer speech in any language
+  // ("ഞാൻ ഇംഗ്ലീഷിൽ സംസാരിക്കാൻ വന്നതാണ്…"). Bare includes: \b is unreliable
+  // outside ASCII. Extend per-script as other languages show up.
+  /ഞാൻ|ഞങ്ങൾ|നിങ്ങൾ|എനിക്ക്/u,
+];
+
+// ── Complexity notation: answer vs. name (2026-08-26) ────────────────────────
+// "O(n)" in a generated title is TWO different failures wearing one shape.
+//
+//   answer   "O(1)" / "O(n log n)" / "O(1) time, O(n) space"
+//   answer   "The two-pointer approach solves this in O(n) time"
+//   NAME     "O(1) Store Class Design" / "Designing an O(1) Store"
+//
+// The user runs DSA interviews constantly, so the complexity IS often the
+// distinguishing feature of the meeting — rejecting every title that mentions
+// it left those sessions unnamed. Reject only when the notation is the whole
+// point of the string rather than one token inside a descriptive noun phrase:
+//
+//   1. ≤2 tokens survive once the notation is removed — the notation IS the title.
+//   2. an assertion verb is present — the phrase claims something about the
+//      complexity ("solves this in O(n) time", "Hash map gives O(1) lookup"),
+//      i.e. it is the answer. Covers the "<language> code uses/is/…" verbs
+//      above plus the ones a complexity claim actually uses (gives/takes/
+//      costs/…), which land inside the 3-6-word window rule 3 can't see.
+//   3. more than 6 words — the naming prompt asks for 3-6, so anything longer
+//      quoting complexity is a sentence, not a name.
+//
+// Detection is the unchanged pattern; only the decision narrowed.
+const COMPLEXITY_NOTATION_RE = /\bO\([^)]{1,12}\)/g;
+const ASSERTION_VERB_RE = /\b(?:uses|is|does|works|runs|solves?|looks|gives?|takes|costs|achieves?|yields|requires?|reduces?|needs)\b/i;
+const TITLE_WORD_WINDOW_MAX = 6;
+
+function isComplexityAnswerTitle(t: string): boolean {
+  const stripped = t.replace(COMPLEXITY_NOTATION_RE, ' ');
+  if (stripped === t) return false; // no complexity notation at all
+  const residual = stripped.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  if (residual.length <= 2) return true;
+  if (ASSERTION_VERB_RE.test(stripped)) return true;
+  return t.split(/\s+/).filter(Boolean).length > TITLE_WORD_WINDOW_MAX;
+}
+
+/** True when a GENERATED title reads as an answer fragment, not a name. */
+export function isAnswerFragmentTitle(title: string): boolean {
+  const t = String(title || '').trim();
+  if (!t) return false;
+  if (ANSWER_FRAGMENT_TITLE_RES.some((re) => re.test(t))) return true;
+  if (isComplexityAnswerTitle(t)) return true;
+  // A single all-lowercase token ("cpp") is an answer artifact — the 3-6-word
+  // title prompt never legitimately produces one, and user/calendar titles do
+  // not pass through this predicate.
+  const words = t.split(/\s+/);
+  if (words.length === 1 && t === t.toLowerCase() && /^[a-z0-9+#.]+$/.test(t)) return true;
+  // An ENTIRELY-lowercase multi-word Latin title is a truncation fragment
+  // ("ral backend for every keystroke" — the clamp caught a line mid-word,
+  // session E 2026-08-23). Generated titles are Title Case; any uppercase
+  // anywhere ("iOS Migration Kickoff") passes. Code-review 2026-08-23: the
+  // rule requires EVERY word to carry an ASCII letter — a mixed-script title
+  // ("പ്രോജക്ട് sync review") has caseless words that can never satisfy the
+  // Title Case expectation, so it must not be judged by it.
+  if (words.length >= 2 && !/[A-Z]/.test(t) && words.every((w) => /[a-z]/.test(w))) return true;
+  return false;
+}
+
+/**
+ * Catch-all for a GENERATED title whose source text is an ANSWER, whatever
+ * the clamp salvages from it: after stripping code fences and the [[GIST]]
+ * tail (the same pre-cleaning cleanMeetingTitle applies), a first content
+ * line over 200 chars is the model answering the transcript — a real title
+ * attempt, even a verbose one with reasoning underneath, keeps its first
+ * line short. Code-review 2026-08-23: the first version of this rule lived
+ * at the call site and measured the RAW first line, so a fence-wrapped
+ * answer ("```\n<450-char explanation>\n```") measured 3 chars and walked
+ * straight past it.
+ */
+export function isAnswerShapedGeneration(rawGenerated: unknown): boolean {
+  let text = String(rawGenerated ?? '').replace(NUL_RE, '');
+  const gistAt = text.indexOf('[[GIST]]');
+  if (gistAt >= 0) text = text.slice(0, gistAt);
+  text = text.replace(FENCE_RE, '');
+  const firstLine = text.split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? '';
+  return firstLine.length > 200;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (!Number.isFinite(value)) return min;
+  return Math.max(min, Math.min(max, value));
+}
+
+function num(value: unknown): number | undefined {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function normalizeConfidence(value: unknown): Confidence {
+  return VALID_CONFIDENCE.has(value as Confidence) ? (value as Confidence) : 'medium';
+}
+
+function inferSeverity(value: unknown): RiskItem['severity'] {
+  const text = cleanString(value).toLowerCase();
+  if (/\b(blocked|critical|security|legal|cannot|won't|miss deadline|outage)\b/.test(text)) return 'high';
+  if (/\b(risk|concern|delay|budget|slip|unclear|dependency)\b/.test(text)) return 'medium';
+  return 'low';
+}
+
+function normalizedKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\b(the|a|an|to|for|and|or|of|in|on|by)\b/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function cleanId(value: unknown): string {
+  return cleanString(value).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 80) || 'section';
+}
+
+function arr(value: unknown): any[] {
+  return Array.isArray(value) ? value : [];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Field coercers. Each accepts loose input (LLM JSON, legacy rows) and a mutable
+// `track` flag set to true whenever a value had to be coerced/dropped.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface Track { repaired: boolean; }
+
+export function sanitizeEvidenceArray(value: unknown, max: number): EvidenceRef[] {
+  return arr(value)
+    .map((item: any) => {
+      // Accept both new (timestampMs, speakerId/speakerName) and legacy (timestamp, speaker).
+      const ts = num(item?.timestampMs) ?? num(item?.timestamp);
+      const speakerName = item?.speakerName ?? item?.speaker;
+      const ref: EvidenceRef = {
+        ...(item?.speakerId ? { speakerId: cleanString(item.speakerId).slice(0, 80) } : {}),
+        ...(speakerName ? { speakerName: cleanString(speakerName).slice(0, 80) } : {}),
+        ...(ts !== undefined ? { timestampMs: ts } : {}),
+        ...(item?.quote ? { quote: cleanString(item.quote).slice(0, 220) } : {}),
+        ...(item?.segmentId ? { segmentId: cleanString(item.segmentId).slice(0, 80) } : {}),
+      };
+      return ref;
+    })
+    .filter((e: EvidenceRef) => e.speakerId || e.speakerName || typeof e.timestampMs === 'number' || e.quote || e.segmentId)
+    .slice(0, max);
+}
+
+export function sanitizeStringArray(value: unknown, max: number): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of arr(value)) {
+    const cleaned = cleanNoteText(item);
+    if (!cleaned || FILLER_RE.test(cleaned)) continue;
+    const key = normalizedKey(cleaned);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(cleaned);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+function dedupeByText<T extends { text: string }>(items: T[], max: number): T[] {
+  const seen = new Set<string>();
+  const out: T[] = [];
+  for (const item of items) {
+    const key = normalizedKey(item.text);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
+export function sanitizeDecisions(value: unknown, max: number, t?: Track): DecisionItem[] {
+  return dedupeByText(arr(value).map((item: any) => {
+    const ts = num(item?.timestampMs) ?? num(item?.timestamp);
+    return {
+      text: cleanNoteText(typeof item === 'string' ? item : item?.text),
+      ...(item?.owner ? { owner: cleanString(item.owner).slice(0, 80) } : {}),
+      ...(ts !== undefined ? { timestampMs: ts } : {}),
+      evidence: sanitizeEvidenceArray(item?.evidence, 3),
+      confidence: normalizeConfidence(item?.confidence),
+      ...(item?.fromUserNotes === true ? { fromUserNotes: true } : {}),
+    } as DecisionItem;
+  }).filter((d: DecisionItem) => d.text), max);
+}
+
+export function sanitizeActions(value: unknown, max: number, t?: Track): ActionItem[] {
+  return dedupeByText(arr(value).map((item: any) => {
+    const ts = num(item?.sourceTimestampMs) ?? num(item?.sourceTimestamp);
+    return {
+      text: cleanNoteText(typeof item === 'string' ? item : item?.text),
+      ...(item?.owner ? { owner: cleanString(item.owner).slice(0, 80) } : {}),
+      ...(item?.deadline ? { deadline: cleanString(item.deadline).slice(0, 80) } : {}),
+      ...(ts !== undefined ? { sourceTimestampMs: ts } : {}),
+      explicitness: VALID_EXPLICITNESS.has(item?.explicitness) ? item.explicitness : 'inferred',
+      evidence: sanitizeEvidenceArray(item?.evidence, 3),
+      confidence: normalizeConfidence(item?.confidence),
+      ...(VALID_ACTION_STATUS.has(item?.status) ? { status: item.status } : {}),
+      ...(item?.carriedOver === true ? { carriedOver: true } : {}),
+      ...(item?.party === 'ours' || item?.party === 'theirs' ? { party: item.party } : {}),
+      ...(item?.fromUserNotes === true ? { fromUserNotes: true } : {}),
+    } as ActionItem;
+  }).filter((a: ActionItem) => a.text), max);
+}
+
+export function sanitizeQuestions(value: unknown, max: number): QuestionItem[] {
+  return dedupeByText(arr(value).map((item: any) => ({
+    text: cleanNoteText(typeof item === 'string' ? item : item?.text),
+    ...(item?.owner ? { owner: cleanString(item.owner).slice(0, 80) } : {}),
+    status: VALID_QUESTION_STATUS.has(item?.status) ? item.status : 'open',
+    evidence: sanitizeEvidenceArray(item?.evidence, 3),
+    ...(item?.confidence ? { confidence: normalizeConfidence(item.confidence) } : {}),
+    ...(item?.carriedOver === true ? { carriedOver: true } : {}),
+    ...(item?.fromUserNotes === true ? { fromUserNotes: true } : {}),
+  } as QuestionItem)).filter((q: QuestionItem) => q.text), max);
+}
+
+export function sanitizeRisks(value: unknown, max: number): RiskItem[] {
+  return dedupeByText(arr(value).map((item: any) => ({
+    text: cleanNoteText(typeof item === 'string' ? item : item?.text),
+    severity: VALID_RISK_SEVERITY.has(item?.severity) ? item.severity : inferSeverity(item?.text),
+    evidence: sanitizeEvidenceArray(item?.evidence, 3),
+    ...(item?.confidence ? { confidence: normalizeConfidence(item.confidence) } : {}),
+  } as RiskItem)).filter((r: RiskItem) => r.text), max);
+}
+
+function sanitizeBullets(value: unknown, max: number): NoteBullet[] {
+  return arr(value).map((item: any) => {
+    const text = typeof item === 'string' ? item : item?.text;
+    return {
+      ...(item?.id ? { id: cleanString(item.id).slice(0, 80) } : {}),
+      text: cleanNoteText(text),
+      evidence: sanitizeEvidenceArray(item?.evidence, 3),
+      ...(item?.confidence ? { confidence: normalizeConfidence(item.confidence) } : {}),
+      ...(item?.fromUserNotes === true ? { fromUserNotes: true } : {}),
+    } as NoteBullet;
+  }).filter((b: NoteBullet) => b.text).slice(0, max);
+}
+
+function sanitizeSections(value: unknown, max: number): MeetingNoteSection[] {
+  return arr(value).map((section: any, index: number) => ({
+    id: cleanId(section?.id || section?.title || `section_${index}`),
+    title: cleanString(section?.title || `Section ${index + 1}`),
+    bullets: sanitizeBullets(section?.bullets, SECTION_BULLET_CAP),
+    order: num(section?.order) ?? index,
+  })).filter((s: MeetingNoteSection) => s.title && s.bullets.length > 0)
+    .sort((a, b) => a.order - b.order)
+    .slice(0, max);
+}
+
+function sanitizePeople(value: unknown, max: number): PersonMention[] {
+  return arr(value).map((p: any) => ({
+    ...(p?.speakerId ? { speakerId: cleanString(p.speakerId).slice(0, 80) } : {}),
+    ...(p?.name ? { name: cleanString(p.name).slice(0, 80) } : {}),
+    ...(p?.role ? { role: cleanString(p.role).slice(0, 80) } : {}),
+    ...(p?.organization ? { organization: cleanString(p.organization).slice(0, 80) } : {}),
+    ...(num(p?.mentions) !== undefined ? { mentions: num(p.mentions) } : {}),
+    ...(p?.confidence ? { confidence: normalizeConfidence(p.confidence) } : {}),
+  } as PersonMention)).filter((p: PersonMention) => p.name || p.speakerId).slice(0, max);
+}
+
+function sanitizeTimeline(value: unknown, max: number): TimelineItem[] {
+  return arr(value).map((item: any, index: number) => {
+    const ts = num(item?.timestampMs) ?? num(item?.timestamp);
+    return {
+      ...(item?.id ? { id: cleanId(item.id) } : { id: `moment_${index}` }),
+      ...(ts !== undefined ? { timestampMs: ts } : {}),
+      title: cleanNoteText(item?.title, 160),
+      ...(item?.description ? { description: cleanNoteText(item.description, 260) } : {}),
+      type: VALID_TIMELINE_TYPE.has(item?.type) ? item.type : 'topic_shift',
+      evidence: sanitizeEvidenceArray(item?.evidence, 3),
+    } as TimelineItem;
+  }).filter((item: TimelineItem) => item.title).slice(0, max);
+}
+
+export function sanitizeFollowUpDraft(value: unknown): FollowUpDraft | undefined {
+  if (!value) return undefined;
+  // Legacy: a plain string body.
+  if (typeof value === 'string') {
+    const body = cleanString(value);
+    if (!body) return undefined;
+    return { type: 'email', body: value.trim(), tone: 'professional' };
+  }
+  if (typeof value !== 'object') return undefined;
+  const raw = value as any;
+  const body = typeof raw.body === 'string' ? raw.body.trim() : '';
+  if (!body) return undefined;
+  return {
+    type: VALID_FOLLOWUP_TYPE.has(raw.type) ? raw.type : 'email',
+    ...(raw.subject ? { subject: cleanString(raw.subject).slice(0, 160) } : {}),
+    body: body.slice(0, 4000),
+    tone: VALID_FOLLOWUP_TONE.has(raw.tone) ? raw.tone : 'professional',
+    ...(Array.isArray(raw.basedOnActionItemIds) ? { basedOnActionItemIds: raw.basedOnActionItemIds.map((x: any) => cleanString(x)).filter(Boolean).slice(0, 50) } : {}),
+    ...(Array.isArray(raw.basedOnDecisionIds) ? { basedOnDecisionIds: raw.basedOnDecisionIds.map((x: any) => cleanString(x)).filter(Boolean).slice(0, 50) } : {}),
+  };
+}
+
+function sanitizeMode(value: unknown): MeetingSummaryModeMeta {
+  const raw = (value && typeof value === 'object') ? value as any : {};
+  const conf = num(raw.detectedConfidence);
+  return {
+    ...(raw.selectedModeId ? { selectedModeId: cleanString(raw.selectedModeId).slice(0, 80) } : {}),
+    ...(raw.selectedModeName ? { selectedModeName: cleanString(raw.selectedModeName).slice(0, 80) } : {}),
+    ...(raw.selectedTemplateType ? { selectedTemplateType: cleanString(raw.selectedTemplateType).slice(0, 80) } : {}),
+    ...(raw.detectedModeId ? { detectedModeId: cleanString(raw.detectedModeId).slice(0, 80) } : {}),
+    ...(raw.detectedModeName ? { detectedModeName: cleanString(raw.detectedModeName).slice(0, 80) } : {}),
+    ...(conf !== undefined ? { detectedConfidence: clamp(conf, 0, 1) } : {}),
+    ...(raw.summaryModeUsed ? { summaryModeUsed: cleanString(raw.summaryModeUsed).slice(0, 80) } : {}),
+  };
+}
+
+function sanitizeGeneration(value: unknown): MeetingSummaryGenerationMeta {
+  const raw = (value && typeof value === 'object') ? value as any : {};
+  const validStrategy = new Set<SummaryStrategy>(['direct', 'map_reduce', 'long_context', 'fallback']);
+  return {
+    strategy: validStrategy.has(raw.strategy) ? raw.strategy : 'fallback',
+    ...(raw.provider ? { provider: cleanString(raw.provider).slice(0, 80) } : {}),
+    ...(raw.model ? { model: cleanString(raw.model).slice(0, 120) } : {}),
+    startedAt: typeof raw.startedAt === 'string' && raw.startedAt ? raw.startedAt : new Date(0).toISOString(),
+    ...(raw.completedAt ? { completedAt: cleanString(raw.completedAt) } : {}),
+    ...(num(raw.durationMs) !== undefined ? { durationMs: num(raw.durationMs) } : {}),
+    ...(num(raw.chunkCount) !== undefined ? { chunkCount: num(raw.chunkCount) } : {}),
+    warnings: sanitizeStringArray(raw.warnings, 12),
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public: validate + repair a full MeetingSummaryV3.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function validateMeetingSummaryV3(value: unknown): ValidationResult<MeetingSummaryV3> {
+  if (!value || typeof value !== 'object') {
+    return { ok: false, errors: ['summary is not an object'], repaired: false };
+  }
+  const raw = value as any;
+  const errors: string[] = [];
+
+  const tldr = sanitizeStringArray(raw.tldr, 6);
+  // Overview is a whole-meeting paragraph TLDR (up to ~400 words ≈ 2800 chars).
+  const overview = cleanNoteText(raw.overview, 2800);
+  const repairedTldr = tldr.length > 0
+    ? tldr
+    : overview.split(/(?<=[.!?])\s+/).map(s => cleanNoteText(s)).filter(Boolean).slice(0, 4);
+
+  const decisions = sanitizeDecisions(raw.decisions, 40);
+  const actionItems = sanitizeActions(raw.actionItems, 40);
+  const openQuestions = sanitizeQuestions(raw.openQuestions, 40);
+  const risks = sanitizeRisks(raw.risks, 40);
+  const sections = sanitizeSections(raw.sections, 24);
+  const followUpDraft = sanitizeFollowUpDraft(raw.followUpDraft);
+
+  const summary: MeetingSummaryV3 = {
+    schemaVersion: 3,
+    title: cleanString(raw.title || 'Meeting Notes') || 'Meeting Notes',
+    tldr: repairedTldr,
+    overview,
+    whatChanged: sanitizeStringArray(raw.whatChanged, 8),
+    decisions,
+    actionItems,
+    openQuestions,
+    risks,
+    sections,
+    ...(followUpDraft ? { followUpDraft } : {}),
+    timeline: sanitizeTimeline(raw.timeline, 24),
+    people: sanitizePeople(raw.people, 30),
+    topics: sanitizeStringArray(raw.topics, 30),
+    sourceQuality: {
+      transcriptCoverage: clamp(Number(raw.sourceQuality?.transcriptCoverage ?? 0), 0, 1),
+      speakerQuality: ['good', 'mixed', 'poor'].includes(raw.sourceQuality?.speakerQuality) ? raw.sourceQuality.speakerQuality : 'mixed',
+      actionItemConfidence: normalizeConfidence(raw.sourceQuality?.actionItemConfidence),
+      warnings: sanitizeStringArray(raw.sourceQuality?.warnings, 12),
+    },
+    mode: sanitizeMode(raw.mode),
+    generation: sanitizeGeneration(raw.generation),
+    ...(Array.isArray(raw.noteBlocks) ? { noteBlocks: raw.noteBlocks.slice(0, 120) } : {}),
+    ...(raw.recipes && typeof raw.recipes === 'object'
+      ? { recipes: Object.fromEntries(Object.entries(raw.recipes).map(([k, v]) => [cleanId(k), cleanString(v)]).filter(([k, v]) => k && v)) }
+      : {}),
+  };
+
+  const hasStructuredContent =
+    summary.decisions.length > 0 ||
+    summary.actionItems.length > 0 ||
+    summary.openQuestions.length > 0 ||
+    summary.risks.length > 0 ||
+    summary.sections.length > 0;
+
+  const hasNarrative = Boolean(summary.overview) || summary.tldr.length > 0 || summary.whatChanged.length > 0;
+
+  if (!hasStructuredContent && !hasNarrative) {
+    errors.push('summary has no usable content');
+    return { ok: false, errors, repaired: true };
+  }
+
+  return { ok: true, data: summary, errors, repaired: true };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Back-compat: render a legacy (pre-V3) detailedSummary as a minimal V3 view.
+// Does NOT mutate or rewrite the stored row — purely for rendering/normalization.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function normalizeLegacySummary(detailed: any): MeetingSummaryV3 | null {
+  if (!detailed || typeof detailed !== 'object') return null;
+  if (detailed.schemaVersion === 3) {
+    const res = validateMeetingSummaryV3(detailed);
+    return res.ok ? res.data! : null;
+  }
+
+  const overview = cleanNoteText(detailed.overview, 600);
+  const keyPoints = sanitizeStringArray(detailed.keyPoints, 12);
+  const legacyActions = sanitizeStringArray(detailed.actionItems, 30);
+  const legacySections = arr(detailed.sections).map((s: any, i: number) => ({
+    id: cleanId(s?.title || `section_${i}`),
+    title: cleanString(s?.title || `Section ${i + 1}`),
+    bullets: sanitizeStringArray(s?.bullets, 30).map(text => ({ text })),
+    order: i,
+  })).filter((s: MeetingNoteSection) => s.title && s.bullets.length > 0);
+
+  if (!overview && keyPoints.length === 0 && legacyActions.length === 0 && legacySections.length === 0) {
+    return null;
+  }
+
+  const v3: MeetingSummaryV3 = {
+    schemaVersion: 3,
+    title: cleanString(detailed.title || 'Meeting Notes') || 'Meeting Notes',
+    tldr: keyPoints.length > 0 ? keyPoints.slice(0, 5) : (overview ? [overview] : []),
+    overview,
+    whatChanged: [],
+    decisions: [],
+    actionItems: legacyActions.map(text => ({ text, explicitness: 'inferred' as const, confidence: 'low' as const })),
+    openQuestions: [],
+    risks: [],
+    sections: legacySections,
+    ...(sanitizeFollowUpDraft(detailed.followUpDraft) ? { followUpDraft: sanitizeFollowUpDraft(detailed.followUpDraft) } : {}),
+    sourceQuality: { transcriptCoverage: 0, speakerQuality: 'mixed', actionItemConfidence: 'low', warnings: ['Rendered from a legacy summary format.'] },
+    mode: {},
+    generation: { strategy: 'fallback', startedAt: new Date(0).toISOString(), warnings: ['legacy'] },
+  };
+  return v3;
+}

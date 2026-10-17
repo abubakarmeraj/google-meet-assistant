@@ -1,0 +1,97 @@
+{
+ "note": "SYNTHETIC: hand-written from the apps' published accessibility labels, not recorded from a call. Replace with a tree recorded by NATIVELY_DUMP_CALL_TREE=1 from a real call on this app and OS.",
+ "app": "teams",
+ "platform": "win32",
+ "expect": {
+  "people": [
+   [
+    "Priya Nair",
+    true
+   ],
+   [
+    "Rob Lane",
+    false
+   ]
+  ],
+  "selfNames": []
+ },
+ "selfNames": [
+  "Evin John"
+ ],
+ "tree": {
+  "trusted": true,
+  "truncated": false,
+  "elapsedMs": 210,
+  "windows": [
+   {
+    "title": "Meeting with Priya Nair | Microsoft Teams",
+    "nodes": [
+     {
+      "depth": 0,
+      "role": "Window",
+      "name": "Meeting with Priya Nair | Microsoft Teams",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 1,
+      "role": "Document",
+      "name": "Microsoft Teams",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "Group",
+      "name": "Evin John, Unmuted, Video on",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "Group",
+      "name": "Priya Nair, Speaking, Video on",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "Group",
+      "name": "Rob Lane, Muted, Video off, Organizer",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "Text",
+      "name": "You are speaking",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "Button",
+      "name": "Leave",
+      "description": "",
+      "value": "",
+      "id": ""
+     },
+     {
+      "depth": 2,
+      "role": "MenuItem",
+      "name": "Rob Lane, Pin for me",
+      "description": "",
+      "value": "",
+      "id": ""
+     }
+    ]
+   }
+  ]
+ }
+}
