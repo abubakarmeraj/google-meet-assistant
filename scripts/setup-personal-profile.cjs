@@ -16,7 +16,7 @@ if (!app.requestSingleInstanceLock()) { console.error('Close Natively before con
 else app.whenReady().then(() => {
   try {
     const backup = path.join(profile, 'setup-backup-' + Date.now());
-    for (const file of ['settings.json', 'credentials.enc', 'credentials.fallback.enc', 'knowledge-workspace/library.json']) {
+    for (const file of ['settings.json', 'Local State', 'credentials.enc', 'credentials.fallback.enc', 'credentials.provenance.json', 'knowledge-workspace/library.json']) {
       const source = path.join(profile, file);
       if (fs.existsSync(source)) { const destination = path.join(backup, file); fs.mkdirSync(path.dirname(destination), { recursive: true }); fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL); }
     }

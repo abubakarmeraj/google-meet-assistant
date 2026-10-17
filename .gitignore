@@ -731,3 +731,8 @@ agent-browser.json
 setup-backup-*/
 *.setup-*
 .install-check-profile/
+# Python bootstrap runtime (logs live outside the repository).
+__pycache__/
+*.pyc
+!scripts/__tests__/test_bootstrap.py
+.personal-launch.vbs

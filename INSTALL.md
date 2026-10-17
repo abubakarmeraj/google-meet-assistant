@@ -6,6 +6,58 @@ applies. Private premium code is not included or needed by this setup.
 
 ## Windows 10/11 x64
 
+### Python installer (recommended for the other laptop)
+
+Install Python 3 first if it is missing. Download **install.py** using GitHub's
+download-file button while signed into this private repository, then run:
+
+```powershell
+py install.py
+```
+
+Only this Python file is needed to start. It uses Python's standard library and
+Microsoft WinGet to install missing Node.js LTS, Git, Rust (MSVC), Visual Studio
+2022 C++ Build Tools/Windows SDK and GitHub CLI. The C++ workload can be a large
+download. It reuses an existing Docker Desktop installation; if missing, it
+installs Docker Desktop. Start Docker Desktop and complete its first-run prompts
+if requested. Required Windows features/hardware virtualization must be available
+for Docker's Linux engine. A prerequisite may require UAC approval or a restart;
+the installer never restarts Windows automatically. Rerun it after a restart.
+
+For a standalone file, it clones this private repository to
+`%LOCALAPPDATA%\Programs\GoogleMeetAssistant`. GitHub sign-in is required once,
+using an account with access to this private repository. No access tokens or API
+keys are included. If run inside a checkout, it installs that checkout instead.
+Existing source files are kept; the installer does not pull over your changes.
+
+Docker search is the Python installer's default. It builds the app, downloads
+Parakeet and the small retrieval models, configures SearXNG, tests a real search,
+creates a Start menu shortcut and opens the app. First installation takes several
+minutes and several GB; missing build tools can take longer. This is an automated
+source build, rather than a signed binary installer. On another laptop, sign into
+your answer provider again; Windows-encrypted credentials are machine-specific.
+
+The prerequisite installer uses Microsoft's documented [WinGet install options](https://learn.microsoft.com/en-us/windows/package-manager/winget/install)
+and [Visual Studio workload arguments](https://learn.microsoft.com/en-us/visualstudio/install/use-command-line-parameters-to-install-visual-studio).
+
+```powershell
+py install.py --check
+py install.py --directory D:\Apps\GoogleMeetAssistant
+py install.py --search wsl
+py install.py --search none --no-launch
+```
+
+WSL mode requires WSL 2 enabled first (`wsl --install --no-distribution` in an
+administrator terminal, then restart). It uses the same dedicated distribution
+as the manual installer. Docker mode does not install this separate WSL distro.
+Logs: `%LOCALAPPDATA%\GoogleMeetAssistant\setup`. Rerun on failure; model downloads
+resume and verify checksums. Settings, keys and uploaded documents remain in
+`%APPDATA%\natively`. Setup refuses to change an unreadable credential store.
+`--profile C:\absolute\test-profile --no-launch` configures a separate profile
+without adding a shortcut or opening the normal app.
+
+### Manual source installation
+
 Install these prerequisites once:
 
 - Node.js 22.13 or newer, including npm (tested with Node 24).

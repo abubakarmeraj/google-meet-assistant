@@ -9,7 +9,22 @@ not a separately relicensed open-source product. Private premium code is exclude
 
 ## Install
 
-After installing Node.js, Git, Python 3, Rust, Visual Studio C++ Build Tools and WSL on Windows:
+On Windows x64, download **install.py** from this private repository and run it with Python 3:
+
+```powershell
+py install.py
+```
+
+It installs missing Node.js, Git, Rust and C++ build tools, clones this private
+repository after GitHub sign-in, downloads the speech/document models, builds the
+app, starts SearXNG using Docker, and adds **Google Meet Assistant** to Start.
+Existing Docker Desktop is reused. Windows may request administrator approval
+or a restart for missing prerequisites; rerun the same file after restarting.
+Close Natively before installing. Existing settings, keys and documents are kept.
+Use `--search wsl` for WSL, `--search none` to skip search, or `--check` to report
+prerequisites. See [the installation guide](INSTALL.md) for paths and details.
+
+For a manual source installation after installing the prerequisites:
 
 ```powershell
 git clone https://github.com/abubakarmeraj/google-meet-assistant.git
