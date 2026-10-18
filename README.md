@@ -9,20 +9,31 @@ not a separately relicensed open-source product. Private premium code is exclude
 
 ## Install
 
-On Windows x64, download **install.py** from this private repository and run it with Python 3:
+On Windows x64, download [install.py](https://raw.githubusercontent.com/abubakarmeraj/google-meet-assistant/main/install.py) and run it with Python 3. No GitHub account is needed:
 
 ```powershell
 py install.py
 ```
 
-It installs missing Node.js, Git, Rust and C++ build tools, clones this private
-repository after GitHub sign-in, downloads the speech/document models, builds the
+It installs missing Node.js, Git, Rust and C++ build tools, downloads this public
+repository anonymously, downloads the speech/document models, builds the
 app, starts SearXNG using Docker, and adds **Google Meet Assistant** to Start.
 Existing Docker Desktop is reused. Windows may request administrator approval
 or a restart for missing prerequisites; rerun the same file after restarting.
 Close Natively before installing. Existing settings, keys and documents are kept.
 Use `--search wsl` for WSL, `--search none` to skip search, or `--check` to report
 prerequisites. See [the installation guide](INSTALL.md) for paths and details.
+
+If the older installer stopped at GitHub login after installing the tools, cancel
+it with **Ctrl+C**, download [finish_install.py](https://raw.githubusercontent.com/abubakarmeraj/google-meet-assistant/main/finish_install.py), and run:
+
+```powershell
+py finish_install.py
+```
+
+It downloads the updated installer and runs only app setup, reusing the installed
+tools. It does not install prerequisites or open a GitHub login page. If you chose
+a custom directory earlier, pass the same `--directory` here.
 
 For a manual source installation after installing the prerequisites:
 

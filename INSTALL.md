@@ -8,8 +8,8 @@ applies. Private premium code is not included or needed by this setup.
 
 ### Python installer (recommended for the other laptop)
 
-Install Python 3 first if it is missing. Download **install.py** using GitHub's
-download-file button while signed into this private repository, then run:
+Install Python 3 first if it is missing. Download [install.py](https://raw.githubusercontent.com/abubakarmeraj/google-meet-assistant/main/install.py)
+without signing into GitHub, then run:
 
 ```powershell
 py install.py
@@ -17,17 +17,17 @@ py install.py
 
 Only this Python file is needed to start. It uses Python's standard library and
 Microsoft WinGet to install missing Node.js LTS, Git, Rust (MSVC), Visual Studio
-2022 C++ Build Tools/Windows SDK and GitHub CLI. The C++ workload can be a large
+2022 C++ Build Tools/Windows SDK. GitHub CLI is not required. The C++ workload can be a large
 download. It reuses an existing Docker Desktop installation; if missing, it
 installs Docker Desktop. Start Docker Desktop and complete its first-run prompts
 if requested. Required Windows features/hardware virtualization must be available
 for Docker's Linux engine. A prerequisite may require UAC approval or a restart;
 the installer never restarts Windows automatically. Rerun it after a restart.
 
-For a standalone file, it clones this private repository to
-`%LOCALAPPDATA%\Programs\GoogleMeetAssistant`. GitHub sign-in is required once,
-using an account with access to this private repository. No access tokens or API
-keys are included. If run inside a checkout, it installs that checkout instead.
+For a standalone file, it clones this public repository to
+`%LOCALAPPDATA%\Programs\GoogleMeetAssistant` anonymously, with Git credential
+helpers and login prompts disabled for that download. No GitHub login, access
+token or API key is needed to download the source. If run inside a checkout, it installs that checkout instead.
 Existing source files are kept; the installer does not pull over your changes.
 
 Docker search is the Python installer's default. It builds the app, downloads
@@ -55,6 +55,35 @@ resume and verify checksums. Settings, keys and uploaded documents remain in
 `%APPDATA%\natively`. Setup refuses to change an unreadable credential store.
 `--profile C:\absolute\test-profile --no-launch` configures a separate profile
 without adding a shortcut or opening the normal app.
+
+### Finish after the older installer's GitHub login prompt
+
+Cancel the old installer with **Ctrl+C** if it is still waiting for login.
+Download [finish_install.py](https://raw.githubusercontent.com/abubakarmeraj/google-meet-assistant/main/finish_install.py) and run:
+
+```powershell
+py finish_install.py
+```
+
+This small, standalone Python file downloads the current installer anonymously
+and runs it with `--resume`. It reuses installed Node, Git, Rust, C++ tools and
+Docker. It does **not** run WinGet or repeat their installation. It downloads the
+app repository if needed, installs its npm dependencies and models, builds the
+app and completes SearXNG/shortcut setup. Normal app downloads are still needed
+because the old installer stopped before fetching the repository.
+
+The default destination matches the older installer:
+`%LOCALAPPDATA%\Programs\GoogleMeetAssistant`. If you chose a different directory
+or search option earlier, use the same values:
+
+```powershell
+py finish_install.py --directory D:\Apps\GoogleMeetAssistant --search docker
+```
+
+An existing complete source checkout is reused. Unrelated files are never
+overwritten. Missing prerequisites are reported instead of installed; use the
+updated `install.py` for those. `py finish_install.py --check` only reports
+prerequisites. Your cloud AI provider may still require its own account/key.
 
 ### Manual source installation
 

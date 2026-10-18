@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-r"""Windows bootstrap for the private personal Natively fork. Python stdlib only.
+r"""Windows bootstrap for the public personal Natively fork. Python stdlib only.
 
 Run: py install.py                         (Docker search; installs missing tools)
      py install.py --check                 (read-only prerequisite report)
      py install.py --search wsl            (alternative search runtime)
+     py install.py --resume                (finish app setup; do not install tools)
      py install.py --directory D:\\Apps\\GoogleMeetAssistant --no-launch
 This file can run alone or from inside the repository. No keys are bundled.
 """
@@ -54,13 +55,10 @@ def refresh_path() -> None:
     local = Path(os.environ["LOCALAPPDATA"])
     # Also work in the same terminal immediately after a fresh installation.
     paths.extend(str(p) for p in [
-        program_files / "nodejs", program_files / "Git/cmd", program_files / "GitHub CLI",
+        program_files / "nodejs", program_files / "Git/cmd",
         program_files / "Docker/Docker/resources/bin", Path.home() / ".cargo/bin",
         local / "Microsoft/WindowsApps", local / "Microsoft/WinGet/Links",
     ])
-    packages = local / "Microsoft/WinGet/Packages"
-    if packages.is_dir():
-        paths.extend(str(p) for p in packages.glob("GitHub.cli_*/bin"))
     os.environ["PATH"] = os.pathsep.join(dict.fromkeys(
         segment for value in paths for segment in value.split(os.pathsep) if segment
     ))
@@ -101,7 +99,7 @@ def rust_ready() -> bool:
                 and "host: x86_64-pc-windows-msvc" in version)
 
 
-def tools_needed(search: str, cloning: bool) -> list[tuple[str, str, str | None]]:
+def tools_needed(search: str) -> list[tuple[str, str, str | None]]:
     tools = []
     if not node_ready():
         tools.append(("Node.js LTS", "OpenJS.NodeJS.LTS", None))
@@ -112,8 +110,6 @@ def tools_needed(search: str, cloning: bool) -> list[tuple[str, str, str | None]
                       "--wait --passive --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"))
     if not rust_ready():
         tools.append(("Rust MSVC toolchain", "Rustlang.Rustup", None))
-    if cloning and probe(["gh", "--version"]) is None:
-        tools.append(("GitHub CLI (private repository sign-in)", "GitHub.cli", None))
     if search == "docker" and probe(["docker", "--version"]) is None:
         tools.append(("Docker Desktop", "Docker.DockerDesktop", None))
     return tools
@@ -130,7 +126,7 @@ class Runner:
             output.write("\n> " + subprocess.list2cmdline([str(a) for a in args]) + "\n")
             output.flush()
             if interactive:
-                # GitHub device login needs the actual console. Never capture tokens.
+                # A tool can explicitly request the actual console.
                 result = subprocess.run(args, cwd=cwd, timeout=timeout)
                 code = result.returncode
             else:
@@ -154,8 +150,8 @@ class Runner:
             raise SetupError(f"Command failed (exit {code}). See {self.log}. Fix the reported issue and rerun this file.")
 
 
-def install_tools(runner: Runner, search: str, cloning: bool) -> None:
-    missing = tools_needed(search, cloning)
+def install_tools(runner: Runner, search: str) -> None:
+    missing = tools_needed(search)
     if missing and not shutil.which("winget"):
         raise SetupError("Install/update Microsoft's App Installer (winget), then rerun: https://aka.ms/getwinget")
     for label, package, override in missing:
@@ -171,13 +167,26 @@ def install_tools(runner: Runner, search: str, cloning: bool) -> None:
         if package == "Rustlang.Rustup":
             runner.run(["rustup", "toolchain", "install", "stable-x86_64-pc-windows-msvc", "--profile", "minimal"])
             runner.run(["rustup", "default", "stable-x86_64-pc-windows-msvc"])
-    remaining = tools_needed(search, cloning)
+    remaining = tools_needed(search)
     if remaining:
         raise SetupError("Tools are still unavailable: " + ", ".join(t[0] for t in remaining)
                          + ". Restart Windows if requested by their installers, then rerun.")
+    require_search_runtime(search)
+
+
+def require_search_runtime(search: str) -> None:
     if search == "wsl" and probe(["wsl.exe", "--status"]) is None:
         raise SetupError("Enable WSL 2 once from an administrator terminal: wsl --install --no-distribution\n"
                          "Restart Windows, then rerun with --search wsl. Docker mode does not require this step.")
+
+
+def resume_tools(search: str) -> None:
+    missing = tools_needed(search)
+    if missing:
+        raise SetupError("Resume only installs the app. Missing prerequisites: " + ", ".join(t[0] for t in missing)
+                         + ". Run the updated install.py without --resume to install them.")
+    require_search_runtime(search)
+    say("Reusing installed prerequisites. No WinGet or GitHub sign-in step will run.")
 
 
 def is_source(folder: Path) -> bool:
@@ -206,12 +215,20 @@ def checkout(runner: Runner, folder: Path) -> None:
     if folder.exists() and (not folder.is_dir() or any(folder.iterdir())):
         raise SetupError("Destination is not an empty directory or this app's source: " + str(folder))
     folder.parent.mkdir(parents=True, exist_ok=True)
-    if probe(["gh", "auth", "status", "--hostname", "github.com"]) is None:
-        say("Sign in to GitHub with the account that can access this private repository.")
-        runner.run(["gh", "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web"], interactive=True)
-    # Only this clone uses gh's credential helper; global Git configuration stays intact.
-    runner.run(["git", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential",
-                "clone", REPOSITORY, str(folder)])
+    # Public read access needs no account. Disable credential helpers and prompts
+    # for this child only, including Git Credential Manager's browser flow.
+    overrides = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never", "GIT_ASKPASS": "", "SSH_ASKPASS": ""}
+    previous = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
+    try:
+        runner.run(["git", "-c", "credential.helper=", "-c", "core.askPass=", "-c", "credential.interactive=false",
+                    "clone", "--depth", "1", REPOSITORY, str(folder)])
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     if not is_source(folder):
         raise SetupError("Repository clone is incomplete. See the log before retrying.")
 
@@ -272,6 +289,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--directory", help="Absolute install directory; defaults to this checkout or LocalAppData/Programs/GoogleMeetAssistant")
     parser.add_argument("--search", choices=["docker", "wsl", "none"], default="docker")
     parser.add_argument("--check", action="store_true", help="Report prerequisites without installing or signing in")
+    parser.add_argument("--resume", action="store_true", help="Skip prerequisite installation and finish app download/build/setup")
     parser.add_argument("--no-launch", action="store_true", help="Do not open the app after installation")
     parser.add_argument("--profile", help="Absolute separate test profile (does not create a normal-profile shortcut)")
     args = parser.parse_args(argv)
@@ -286,7 +304,7 @@ def main(argv: list[str] | None = None) -> int:
     folder = destination(args.directory, Path(__file__).resolve(), local)
     if folder.exists() and not is_source(folder) and (not folder.is_dir() or any(folder.iterdir())):
         raise SetupError("Choose an empty install directory; no existing files will be overwritten: " + str(folder))
-    missing = tools_needed(args.search, not is_source(folder))
+    missing = tools_needed(args.search)
     say("Google Meet Assistant personal installer\nSource: " + REPOSITORY + "\nInstall directory: " + str(folder)
         + "\nSearch: " + args.search + "\nPython: " + sys.executable)
     if args.check:
@@ -295,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.search == "wsl" and probe(["wsl.exe", "--status"]) is None:
             say("Missing: WSL 2 (enable it and restart before --search wsl)")
             return 1
-        say("Prerequisites ready." if not missing else "Run without --check to install missing tools.")
+        say("Prerequisites ready." if not missing else "Run install.py without --check or --resume to install missing tools.")
         return int(bool(missing))
     logs = local / "GoogleMeetAssistant/setup"
     logs.mkdir(parents=True, exist_ok=True)
@@ -305,7 +323,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with install_lock(logs / "installer.lock"):
             runner = Runner(log)
-            install_tools(runner, args.search, not is_source(folder))
+            if args.resume:
+                resume_tools(args.search)
+            else:
+                install_tools(runner, args.search)
             checkout(runner, folder)
             node = shutil.which("node")
             setup = [node, str(folder / "scripts/setup-personal.mjs"), "--search", args.search]
